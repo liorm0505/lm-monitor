@@ -4,18 +4,38 @@ Lightweight Python HTTP dashboard for monitoring macOS Memory Pressure, RAM usag
 
 ## Quick Install on Mac Mini M4 Pro
 
-```bash
-# 1. Create directory & copy the script
-mkdir -p ~/lm-monitor
-cp llm_monitor.py ~/lm-monitor/
+### 1. Clone the repo
 
-# 2. Install dependencies
-cd ~/lm-monitor
+```bash
+cd /home/lior                          # or wherever you want it
+git clone https://github.com/liorm0505/lm-monitor.git
+cd lm-monitor
+```
+
+This creates:
+```
+/home/lior/lm-monitor/          ← repo root
+│
+├── llm_monitor.py              ← dashboard script ✅ (in git)
+├── requirements.txt            ← psutil + requests ✅ (in git)
+├── .gitignore                  ← excludes venv, cache, secrets ✅ (in git)
+├── README.md                   ← this file ✅ (in git)
+└── .venv/                      ← virtual env ❌ (NOT in git — ignored)
+```
+
+### 2. Create the virtual environment
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-# 3. Run it
+The `.venv/` folder lives alongside the script but is **ignored by git** (see `.gitignore`). It stays local and never gets pushed to GitHub.
+
+### 3. Run it
+
+```bash
 python3 llm_monitor.py
 ```
 
