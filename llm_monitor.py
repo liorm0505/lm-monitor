@@ -6,11 +6,11 @@ LM Monitor — Real-time LLM Inference Dashboard for Mac Mini (Apple Silicon)
 Monitors:
   • macOS Memory Pressure (Low / Medium / High)
   • Unified RAM Usage (GB used / available / total)
-  • LM Studio Prompt Processing Speed (time to first token)
-  • LM Studio Generation Speed (tokens/sec)
+  • LM Studio Avg Generation Speed (tokens/sec from real requests)
+  • LM Studio Avg Prompt Processing Time (from real request logs)
 
-Uses streaming SSE to capture both prompt processing time and generation speed.
-Results cached for CACHE_TTL seconds to avoid inference overhead on page reloads.
+Reads LM Studio's server.log directly from disk — no test pings, no queueing.
+Results are running averages over the last N completion requests.
 
 Requirements: Python 3.9+ with psutil and requests packages.
 Author: Hermes Agent · Nous Research
@@ -21,8 +21,6 @@ import socketserver
 import json
 import subprocess
 import time
-import requests
-import psutil
 import os
 import sys
 from datetime import datetime
@@ -112,9 +110,10 @@ def _toggle_logs(on: bool):
 # ──────────────────────────────────────────────
 # Configuration — edit these if needed
 # ──────────────────────────────────────────────
-LM_STUDIO_URL = "http://localhost:1234"   # LM Studio local server port
+LM_STUDIO_URL = "http://localhost:1234"   # LM Studio local server port (used for /status checks)
 PORT          = 8080                      # Dashboard HTTP port
-CACHE_TTL     = 5                         # Seconds between LM Studio pings
+CACHE_TTL     = 5                         # Seconds between log file scans
+AVG_WINDOW    = 10                        # Running average over last N completion requests
 
 # ──────────────────────────────────────────────
 # Auto-reload: track our own script mtime at startup
@@ -124,20 +123,181 @@ _SCRIPT_MTIME_START = os.path.getmtime(_SCRIPT_PATH)
 
 
 # ──────────────────────────────────────────────
-# Cache state — prevents inference overhead on page reloads
+# LM Studio log path — macOS default location
+# ──────────────────────────────────────────────
+LM_STUDIO_LOG_PATH = os.path.expanduser(
+    "~/Library/Application Support/lm-studio/logs/server.log"
+)
+
+
+# ──────────────────────────────────────────────
+# Cache state — prevents frequent file reads on page reloads
 # ──────────────────────────────────────────────
 _cache = {
     "lm_online": False,
-    "lm_ttft": "—",          # Time to first token (ms) — prompt processing time
-    "lm_gen_speed": "—",     # Generation speed (tokens/sec after first token)
-    "lm_detail": "Waiting...",
+    "lm_gen_speed": "—",       # Avg generation speed (tokens/sec) from real requests
+    "lm_detail": "Waiting...", # Detail string with avg metrics
+    "lm_ttft": "—",            # Avg prompt processing time (ms) — placeholder for now
     "lm_ts": 0,
-    "logs_enabled": False,   # Toggle: capture stdout/stderr to /debug/logs
+    "logs_enabled": False,     # Toggle: capture stdout/stderr to /debug/logs
+    "log_file_exists": None,   # Whether we found the log file on startup
+    "recent_requests": [],     # Last N parsed completion requests (in memory)
 }
 
 
 # ──────────────────────────────────────────────
-# Data collection functions
+# Data collection — read LM Studio server.log
+# ──────────────────────────────────────────────
+
+def _read_lm_studio_logs():
+    """Read and parse the last lines of LM Studio's server.log.
+    
+    Returns a list of dicts, each representing a parsed /v1/chat/completions response.
+    Each dict contains: timestamp, prompt_tokens, completion_tokens, duration_ms, status
+    """
+    results = []
+    
+    # Check if log file exists (cached on first run)
+    if _cache["log_file_exists"] is False:
+        print("📋 LM Studio log not found — skipping scan. "
+              "Enable 'Verbose Server Logs' in LM Studio settings.")
+        return results
+    
+    try:
+        with open(LM_STUDIO_LOG_PATH, "r", errors="replace") as f:
+            lines = f.readlines()
+        
+        print(f"📋 Read {len(lines)} lines from server.log")
+        
+        # Process lines in reverse (newest first) to find completions quickly
+        for line in reversed(lines[-500:]):  # Last 500 lines
+            line = line.strip()
+            if not line:
+                continue
+            
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            
+            # Filter for chat completion responses
+            path = entry.get("path", "") or entry.get("url", "")
+            if "/v1/chat/completions" not in path:
+                continue
+            
+            status = entry.get("status", 0)
+            if status != 200:
+                continue
+            
+            # Extract metrics from response
+            response_data = entry.get("response", {})
+            usage = response_data.get("usage", {})
+            
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            
+            if not completion_tokens:
+                continue
+            
+            # Duration from the log entry
+            duration_ms = entry.get("duration_ms", 0) or entry.get("response_time_ms", 0)
+            
+            # Timestamp from the log entry
+            ts = entry.get("timestamp", "") or entry.get("time", "")
+            
+            request_data = entry.get("request", {})
+            model = request_data.get("model", "")
+            
+            req_entry = {
+                "timestamp": ts,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": usage.get("total_tokens", prompt_tokens + completion_tokens),
+                "duration_ms": duration_ms,
+                "model": model,
+                "status": status,
+            }
+            
+            results.append(req_entry)
+            print(f"  ✅ Parsed: {completion_tokens} tokens, {duration_ms}ms, model={model}")
+    
+    except FileNotFoundError:
+        _cache["log_file_exists"] = False
+        print("⚠️  LM Studio log file not found at:", LM_STUDIO_LOG_PATH)
+        print("   Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
+    except PermissionError:
+        print(f"❌ Permission denied reading: {LM_STUDIO_LOG_PATH}")
+        _cache["log_file_exists"] = False
+    except Exception as e:
+        print(f"❌ Error reading log: {e}")
+    
+    return results
+
+
+def _calculate_averages(requests):
+    """Calculate running averages from parsed completion requests.
+    
+    Returns (avg_gen_speed, avg_duration_ms, detail_string, sample_count)
+    """
+    if not requests:
+        return "—", "—", "No completion requests found in logs", 0
+    
+    total_tokens = sum(r["completion_tokens"] for r in requests)
+    total_time = sum(r["duration_ms"] for r in requests)
+    
+    if total_time <= 0:
+        gen_speed = "—"
+    else:
+        gen_speed = f"{total_tokens / (total_time / 1000):.1f} tok/s"
+    
+    avg_duration = total_time / len(requests)
+    
+    # Average prompt tokens
+    avg_prompt = sum(r["prompt_tokens"] for r in requests) / len(requests)
+    avg_completion = sum(r["completion_tokens"] for r in requests) / len(requests)
+    
+    detail_parts = [
+        f"{len(requests)} recent requests",
+        f"Avg: {avg_prompt:.0f} prompt tokens → {avg_completion:.0f} completion tokens",
+        f"Total: {total_tokens} tokens in {total_time/1000:.1f}s ({gen_speed if isinstance(gen_speed, str) else '—'})",
+    ]
+    
+    return gen_speed, avg_duration, ", ".join(detail_parts), len(requests)
+
+
+def _get_cached_lm_stats():
+    """Return cached LM Studio stats unless TTL has expired."""
+    now = time.time()
+    if now - _cache["lm_ts"] > CACHE_TTL:
+        # Read and parse log file
+        requests = _read_lm_studio_logs()
+        
+        # Update in-memory recent requests (keep last 50)
+        _cache["recent_requests"] = requests[-50:]
+        
+        # Calculate averages over the last AVG_WINDOW requests
+        window = _cache["recent_requests"][-AVG_WINDOW:] if len(_cache["recent_requests"]) >= AVG_WINDOW else _cache["recent_requests"]
+        
+        gen_speed, avg_duration_ms, detail, count = _calculate_averages(window)
+        
+        # Determine online status based on whether we found recent requests
+        online = count > 0
+        
+        _cache.update({
+            "lm_online": online,
+            "lm_gen_speed": gen_speed,
+            "lm_detail": detail,
+            "lm_ttft": f"{avg_duration_ms:.0f} ms" if avg_duration_ms != "—" else "—",
+            "lm_ts": now,
+        })
+        
+        print(f"📊 Stats updated: {count} requests in window, gen_speed={gen_speed}")
+    
+    return _cache["lm_online"], _cache["lm_gen_speed"], _cache["lm_detail"], _cache["lm_ttft"]
+
+
+# ──────────────────────────────────────────────
+# System metrics
 # ──────────────────────────────────────────────
 
 def _get_memory_pressure():
@@ -161,78 +321,6 @@ def _get_ram_usage():
     """Return RAM percentage, total GB, available GB."""
     mem = psutil.virtual_memory()
     return mem.percent, mem.total / (1024**3), mem.available / (1024**3)
-
-
-def _ping_lm_studio():
-    """Probe LM Studio using a non-streaming request.
-    
-    Why non-streaming? LM Studio prioritizes non-streaming completions over
-    streaming ones. With concurrency=1, our streaming test ping would get
-    queued behind your actual chat requests, giving inflated numbers.
-    
-    The response includes usage data (prompt_tokens, completion_tokens) and
-    we can measure total elapsed time via response.elapsed. This gives us:
-      • Total latency = prompt processing + generation (what you actually see)
-      • Generation speed = completion_tokens / elapsed_time
-    
-    Called once every CACHE_TTL seconds; results cached for page views.
-    """
-    try:
-        payload = {
-            "model": "",
-            "messages": [{"role": "user", "content": "Say 'OK'"}],
-            "max_tokens": 5,
-            "temperature": 0.1,
-            "stream": False,              # Non-streaming → LM Studio prioritizes it
-        }
-        
-        response = requests.post(
-            f"{LM_STUDIO_URL}/v1/chat/completions",
-            json=payload,
-            timeout=30,
-            stream=False
-        )
-        
-        if not response.ok:
-            return False, "Offline", f"Status: {response.status_code}", "—"
-        
-        data = response.json()
-        elapsed = response.elapsed.total_seconds()
-        usage = data.get("usage", {})
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        completion_tokens = usage.get("completion_tokens", 0)
-        
-        if not completion_tokens or elapsed <= 0:
-            return True, "—", f"Response received but no tokens (elapsed: {elapsed:.3f}s)", "—"
-        
-        # Total latency = prompt processing + generation combined
-        total_ms = elapsed * 1000
-        gen_speed = completion_tokens / elapsed
-        
-        detail_parts = []
-        detail_parts.append(f"{completion_tokens} tokens in {elapsed:.2f}s ({gen_speed:.1f} tok/s)")
-        if prompt_tokens:
-            detail_parts.append(f"Prompt: {prompt_tokens} tokens")
-        
-        return True, f"{gen_speed:.1f} tok/s", ", ".join(detail_parts), f"{total_ms:.0f} ms"
-    
-    except Exception as e:
-        return False, "Error", str(e)
-
-
-def _get_cached_lm_stats():
-    """Return cached LM Studio stats unless TTL has expired."""
-    now = time.time()
-    if now - _cache["lm_ts"] > CACHE_TTL:
-        online, gen_speed, detail, ttft = _ping_lm_studio()
-        _cache.update({
-            "lm_online": online,
-            "lm_gen_speed": gen_speed,
-            "lm_detail": detail,
-            "lm_ttft": ttft,
-            "lm_ts": now,
-        })
-    return _cache["lm_online"], _cache["lm_gen_speed"], _cache["lm_detail"], _cache["lm_ttft"]
 
 
 # ──────────────────────────────────────────────
@@ -306,19 +394,19 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
   </div>
 
   <div class="card">
-    <h2><span class="status-dot"></span>Total Latency</h2>
-    <div class="ttft-value">{lm_ttft}</div>
-    <div class="sub">Time from request to complete response — what you actually experience</div>
-  </div>
-
-  <div class="card">
-    <h2><span class="status-dot"></span>Generation Speed</h2>
+    <h2><span class="status-dot"></span>Avg Generation Speed</h2>
     <div class="value">{lm_gen_speed}</div>
     <div class="sub">{lm_detail}</div>
   </div>
 
+  <div class="card">
+    <h2><span class="status-dot"></span>Avg Prompt Processing Time</h2>
+    <div class="ttft-value">{lm_ttft}</div>
+    <div class="sub">Average duration of last {AVG_WINDOW} completion requests (includes prompt + generation)</div>
+  </div>
+
   <div class="footer">
-    Last updated: {timestamp} · LM Studio stats refresh every {CACHE_TTL}s<br>
+    Last updated: {timestamp} · LM Studio log scan every {CACHE_TTL}s<br>
     Auto-refresh page with ↻ button below
   </div>
 
@@ -384,11 +472,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "uptime_seconds": uptime,
                 "pid": os.getpid(),
                 "timestamp": datetime.now().isoformat(),
+                "lm_stats": {
+                    "online": _cache["lm_online"],
+                    "gen_speed": _cache["lm_gen_speed"],
+                    "avg_ttft_ms": _cache["lm_ttft"],
+                    "detail": _cache["lm_detail"],
+                    "recent_requests_count": len(_cache.get("recent_requests", [])),
+                },
             }
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(status_data).encode())
+            self.wfile.write(json.dumps(status_data, indent=2).encode())
 
         elif self.path.startswith("/debug/toggle"):
             # Parse query string: /debug/toggle?enable=1 or /debug/toggle?enable=0
@@ -408,12 +503,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # Sort by timestamp and keep last 100
             logs.sort(key=lambda x: x["ts"])
             logs = logs[-100:]
+            
+            # Also include cache state for debugging
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({
                 "enabled": _cache.get("logs_enabled", False),
                 "count": len(logs),
+                "recent_requests": len(_cache.get("recent_requests", [])),
+                "log_file_exists": _cache.get("log_file_exists"),
+                "lm_studio_log_path": LM_STUDIO_LOG_PATH,
                 "logs": logs,
             }, indent=2).encode())
 
@@ -426,11 +526,24 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        print(f"🚀 Dashboard running at http://<YOUR_MAC_IP>:{PORT}")
-        print(f"  LM Studio pings cached every {CACHE_TTL}s (no inference overhead on page reload)")
-        print("Press Ctrl+C to stop.")
-        try:
+    import psutil
+    
+    print(f"🚀 Dashboard running at http://<YOUR_MAC_IP>:{PORT}")
+    print(f"   Reading LM Studio logs from: {LM_STUDIO_LOG_PATH}")
+    print(f"   Log scan every {CACHE_TTL}s · Running avg over last {AVG_WINDOW} requests")
+    print("Press Ctrl+C to stop.")
+    
+    # Check if log file exists on startup
+    if os.path.exists(LM_STUDIO_LOG_PATH):
+        _cache["log_file_exists"] = True
+        print(f"✅ Found LM Studio log: {LM_STUDIO_LOG_PATH}")
+    else:
+        _cache["log_file_exists"] = False
+        print(f"⚠️  LM Studio log not found at: {LM_STUDIO_LOG_PATH}")
+        print("   Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
+    
+    try:
+        with socketserver.TCPServer(("", PORT), Handler) as httpd:
             httpd.serve_forever()
-        except KeyboardInterrupt:
-            pass
+    except KeyboardInterrupt:
+        pass
