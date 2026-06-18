@@ -209,7 +209,7 @@ def _ping_lm_studio():
                             choices = chunk.get("choices", [])
                             for choice in choices:
                                 delta = choice.get("delta", {})
-                                content = delta.get("content")
+                                content = delta.get("content") or delta.get("text")
                                 if content and first_token_time is None:
                                     first_token_time = (time.time() - start_time) * 1000  # ms
                                 total_tokens += 1
@@ -229,11 +229,21 @@ def _ping_lm_studio():
             ttft_str = f"{first_token_time:.0f} ms"
             detail_parts.append(f"TTFT: {ttft_str}")
         
-        # Generation speed = tokens/sec AFTER first token
+        # Generation speed = tokens/sec during generation phase ONLY (after first token)
         if total_tokens > 0 and elapsed_total > 0:
-            gen_speed = total_tokens / elapsed_total
-            gen_speed_str = f"{gen_speed:.1f} tok/s"
-            detail_parts.append(f"{total_tokens} tokens in {elapsed_total:.2f}s ({gen_speed_str})")
+            if first_token_time is not None:
+                gen_duration = elapsed_total - (first_token_time / 1000.0)
+                if gen_duration > 0:
+                    gen_speed = total_tokens / gen_duration
+                    gen_speed_str = f"{gen_speed:.1f} tok/s"
+                    detail_parts.append(f"{total_tokens} tokens in {gen_duration:.2f}s ({gen_speed_str})")
+                else:
+                    gen_speed_str = f"{total_tokens/elapsed_total:.1f} tok/s"
+                    detail_parts.append(f"{total_tokens} tokens in ~{elapsed_total:.3f}s ({gen_speed_str})")
+            else:
+                gen_speed = total_tokens / elapsed_total
+                gen_speed_str = f"{gen_speed:.1f} tok/s"
+                detail_parts.append(f"{total_tokens} tokens in {elapsed_total:.2f}s ({gen_speed_str})")
         
         if not detail_parts:
             detail_parts.append("Waiting for response...")
