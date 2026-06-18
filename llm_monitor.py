@@ -28,6 +28,11 @@ import sys
 from datetime import datetime
 
 # ──────────────────────────────────────────────
+# Startup timestamp — used for uptime tracking
+# ──────────────────────────────────────────────
+_START_TIME = time.time()
+
+# ──────────────────────────────────────────────
 # Configuration — edit these if needed
 # ──────────────────────────────────────────────
 LM_STUDIO_URL = "http://localhost:1234"   # LM Studio local server port
@@ -268,6 +273,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-type", "text/html")
             self.end_headers()
             self.wfile.write(html.encode())
+
+        elif self.path == "/status":
+            uptime = int(time.time() - _START_TIME)
+            status_data = {
+                "status": "running",
+                "uptime_seconds": uptime,
+                "pid": os.getpid(),
+                "timestamp": datetime.now().isoformat(),
+            }
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(status_data).encode())
+
         else:
             super().do_GET()
 
