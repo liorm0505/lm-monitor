@@ -38,8 +38,8 @@ CACHE_TTL     = 5                         # Seconds between LM Studio pings
 # ──────────────────────────────────────────────
 _cache = {
     "lm_online": False,
-    "lm_ttft": "—",          # Time to first token (ms)
-    "lm_speed": "—",         # Tokens/sec
+    "lm_ttft": "—",          # Time to first token (ms) — prompt processing time
+    "lm_gen_speed": "—",     # Generation speed (tokens/sec after first token)
     "lm_detail": "Waiting...",
     "lm_ts": 0,
 }
@@ -125,28 +125,29 @@ def _ping_lm_studio():
                         except json.JSONDecodeError:
                             continue
         
-        # Build results
+        # Build results — separate prompt processing (TTFT) from generation speed
         if not response.ok:
-            return False, "Offline", f"Status: {response.status_code}"
+            return False, "Offline", f"Status: {response.status_code}", "—"
         
         detail_parts = []
+        ttft_str = "—"
+        gen_speed_str = "—"
+        
+        # TTFT = prompt processing time (ms)
         if first_token_time is not None:
             ttft_str = f"{first_token_time:.0f} ms"
             detail_parts.append(f"TTFT: {ttft_str}")
-        else:
-            ttft_str = "N/A"
         
+        # Generation speed = tokens/sec AFTER first token
         if total_tokens > 0 and elapsed_total > 0:
-            speed = total_tokens / elapsed_total
-            speed_str = f"{speed:.1f} tok/s"
-            detail_parts.append(f"{total_tokens} tokens in {elapsed_total:.2f}s ({speed_str})")
-        else:
-            speed_str = "N/A"
+            gen_speed = total_tokens / elapsed_total
+            gen_speed_str = f"{gen_speed:.1f} tok/s"
+            detail_parts.append(f"{total_tokens} tokens in {elapsed_total:.2f}s ({gen_speed_str})")
         
         if not detail_parts:
             detail_parts.append("Waiting for response...")
         
-        return True, speed_str, ", ".join(detail_parts)
+        return True, gen_speed_str, ", ".join(detail_parts), ttft_str
     
     except Exception as e:
         return False, "Error", str(e)
@@ -156,22 +157,22 @@ def _get_cached_lm_stats():
     """Return cached LM Studio stats unless TTL has expired."""
     now = time.time()
     if now - _cache["lm_ts"] > CACHE_TTL:
-        online, speed, detail = _ping_lm_studio()
-        ttft = "—"  # Will be extracted from detail or set separately
+        online, gen_speed, detail, ttft = _ping_lm_studio()
         _cache.update({
             "lm_online": online,
-            "lm_speed": speed,
+            "lm_gen_speed": gen_speed,
             "lm_detail": detail,
+            "lm_ttft": ttft,
             "lm_ts": now,
         })
-    return _cache["lm_online"], _cache["lm_speed"], _cache["lm_detail"]
+    return _cache["lm_online"], _cache["lm_gen_speed"], _cache["lm_detail"], _cache["lm_ttft"]
 
 
 # ──────────────────────────────────────────────
 # HTML generation — responsive mobile dashboard
 # ──────────────────────────────────────────────
 
-def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_online, lm_speed, lm_detail):
+def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_online, lm_gen_speed, lm_detail, lm_ttft):
     timestamp = datetime.now().strftime("%H:%M:%S")
     dot_color = "#34c759" if lm_online else "#ff3b30"
 
@@ -194,6 +195,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
   .status-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; background: {dot_color}; box-shadow: 0 0 6px {dot_color}; }}
   .refresh-btn {{ position: fixed; bottom: 20px; right: 20px; background: #007aff; color: white; border: none; padding: 14px; border-radius: 50%; font-size: 22px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }}
   .footer {{ text-align: center; color: #555; font-size: 0.7em; margin-top: 28px; line-height: 1.6; }}
+  .ttft-value {{ font-size: 1.6em; font-weight: 600; color: #ff9f0a; }}
 </style>
 </head>
 <body>
@@ -211,8 +213,14 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
   </div>
 
   <div class="card">
-    <h2><span class="status-dot"></span>LM Studio Speed</h2>
-    <div class="value">{lm_speed}</div>
+    <h2><span class="status-dot"></span>Prompt Processing (TTFT)</h2>
+    <div class="ttft-value">{lm_ttft}</div>
+    <div class="sub">Time from request to first token — how fast the model reads & processes your prompt</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="status-dot"></span>Generation Speed</h2>
+    <div class="value">{lm_gen_speed}</div>
     <div class="sub">{lm_detail}</div>
   </div>
 
@@ -235,11 +243,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.path == "/":
             pressure, p_color = _get_memory_pressure()
             ram_pct, ram_total, ram_avail = _get_ram_usage()
-            lm_online, lm_speed, lm_detail = _get_cached_lm_stats()
+            lm_online, lm_gen_speed, lm_detail, lm_ttft = _get_cached_lm_stats()
 
             html = generate_html(
                 pressure, p_color, ram_pct, ram_total, ram_avail,
-                lm_online, lm_speed, lm_detail
+                lm_online, lm_gen_speed, lm_detail, lm_ttft
             )
             self.send_response(200)
             self.send_header("Content-type", "text/html")

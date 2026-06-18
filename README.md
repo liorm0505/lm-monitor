@@ -56,7 +56,13 @@ ipconfig getifaddr en1   # Ethernet
 |--------|-------------|
 | **Memory Pressure** | macOS memory pressure state (Low/Medium/High) |
 | **RAM Usage** | Current RAM usage percentage + GB available/total |
-| **LM Studio Speed** | Tokens/sec + TTFT (Time to First Token) via API ping |
+| **Prompt Processing (TTFT)** | Time from request to first token — how fast the model reads & processes your prompt |
+| **Generation Speed** | Tokens/sec after first token — how fast the model generates output |
+
+## What Each Metric Tells You
+
+- **TTFT (Time to First Token):** High TTFT means the model is slow at *reading* your prompt. This is usually dominated by context length, model size, and CPU/GPU offload settings in LM Studio.
+- **Generation Speed:** Low gen speed means the model is slow at *writing* tokens. On Apple Silicon this is typically memory-bandwidth bound — faster with smaller models or less GPU offload.
 
 ## Configuration
 
