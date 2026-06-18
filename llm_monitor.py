@@ -23,6 +23,8 @@ import subprocess
 import time
 import requests
 import psutil
+import os
+import sys
 from datetime import datetime
 
 # ──────────────────────────────────────────────
@@ -31,6 +33,12 @@ from datetime import datetime
 LM_STUDIO_URL = "http://localhost:1234"   # LM Studio local server port
 PORT          = 8080                      # Dashboard HTTP port
 CACHE_TTL     = 5                         # Seconds between LM Studio pings
+
+# ──────────────────────────────────────────────
+# Auto-reload: track our own script mtime at startup
+# ──────────────────────────────────────────────
+_SCRIPT_PATH = os.path.abspath(__file__)
+_SCRIPT_MTIME_START = os.path.getmtime(_SCRIPT_PATH)
 
 
 # ──────────────────────────────────────────────
@@ -240,6 +248,13 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
+        # Auto-reload: if the script file changed since we started, restart ourselves
+        global _SCRIPT_MTIME_START
+        current_mtime = os.path.getmtime(_SCRIPT_PATH)
+        if current_mtime > _SCRIPT_MTIME_START:
+            print("🔄 Script changed — reloading…")
+            os.execv(sys.executable, [sys.executable, __file__])
+
         if self.path == "/":
             pressure, p_color = _get_memory_pressure()
             ram_pct, ram_total, ram_avail = _get_ram_usage()
