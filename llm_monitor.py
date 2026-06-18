@@ -26,6 +26,7 @@ import psutil
 import os
 import sys
 from datetime import datetime
+from io import StringIO
 
 # ──────────────────────────────────────────────
 # Startup timestamp — used for uptime tracking
@@ -63,6 +64,51 @@ def _uptime_str():
     else:
         return f"{elapsed // 3600}h {(elapsed % 3600) // 60}m ago"
 
+
+# ──────────────────────────────────────────────
+# Debug log capture — lightweight stdout/stderr wrapper
+# ──────────────────────────────────────────────
+
+class _LogCapture(StringIO):
+    """Captures writes to a circular buffer. Only active when enabled."""
+    def __init__(self, max_size=200):
+        super().__init__()
+        self._buffer = []
+        self._max = max_size
+
+    def write(self, text):
+        if _cache.get("logs_enabled"):
+            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            self._buffer.append({"ts": ts, "msg": text.rstrip("\n")})
+            # FIFO: keep only last N entries
+            if len(self._buffer) > self._max:
+                del self._buffer[:len(self._buffer) - self._max]
+        return super().write(text)
+
+    def flush(self):
+        pass  # no-op for StringIO
+
+    def get_logs(self):
+        return list(self._buffer)
+
+
+_debug_stdout = _LogCapture()
+_debug_stderr = _LogCapture()
+_debug_original_stdout = sys.stdout
+_debug_original_stderr = sys.stderr
+
+
+def _toggle_logs(on: bool):
+    """Redirect stdout/stderr to capture buffers, or restore originals."""
+    global _debug_stdout, _debug_stderr, _debug_original_stdout, _debug_original_stderr
+    if on:
+        sys.stdout = _debug_stdout
+        sys.stderr = _debug_stderr
+    else:
+        sys.stdout = _debug_original_stdout
+        sys.stderr = _debug_original_stderr
+
+
 # ──────────────────────────────────────────────
 # Configuration — edit these if needed
 # ──────────────────────────────────────────────
@@ -86,6 +132,7 @@ _cache = {
     "lm_gen_speed": "—",     # Generation speed (tokens/sec after first token)
     "lm_detail": "Waiting...",
     "lm_ts": 0,
+    "logs_enabled": False,   # Toggle: capture stdout/stderr to /debug/logs
 }
 
 
@@ -221,6 +268,8 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
     dot_color = "#34c759" if lm_online else "#ff3b30"
     commit_hash, commit_ts = _get_git_info()
     uptime = _uptime_str()
+    logs_enabled = _cache.get("logs_enabled", False)
+    dbg_color = "#ff453a" if logs_enabled else "#8e8e93"  # Red when on, gray when off
 
     # Format commit time as relative ("2 min ago", "3 days ago", etc.)
     try:
@@ -262,6 +311,8 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
   .status-bar span {{ font-size: 0.75em; color: #888; }}
   .status-bar .commit {{ color: #64d2ff; font-family: 'SF Mono', 'Fira Code', monospace; font-weight: 600; }}
   .status-bar .uptime {{ color: #34c759; }}
+  .debug-toggle {{ position: fixed; bottom: 80px; right: 20px; background: {dbg_color}; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
+  .debug-toggle:hover {{ opacity: 1; }}
 </style>
 </head>
 <body>
@@ -304,6 +355,19 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
     <span>·</span>
     <span>● running</span>
   </div>
+
+  <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()">🐛</button>
+
+  <script>
+    // Toggle debug logging on/off
+    function toggleDebug() {{
+      const btn = document.getElementById('debugBtn');
+      const isOn = btn.style.background === 'rgb(255, 69, 58)';
+      fetch('/debug/toggle?enable=' + (isOn ? '0' : '1'))
+        .then(() => {{ location.reload(); }})
+        .catch(() => {{}});
+    }}
+  </script>
 
   <button class="refresh-btn" onclick="location.reload()">↻</button>
 </body>
@@ -349,6 +413,33 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(status_data).encode())
+
+        elif self.path.startswith("/debug/toggle"):
+            # Parse query string: /debug/toggle?enable=1 or /debug/toggle?enable=0
+            params = self.path.split("?")[1] if "?" in self.path else ""
+            enable = "1" in params or "true" in params.lower()
+            _cache["logs_enabled"] = enable
+            _toggle_logs(enable)
+            response_text = "Debug logging enabled" if enable else "Debug logging disabled"
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(response_text.encode())
+
+        elif self.path == "/debug/logs":
+            # Return last 100 log entries as JSON
+            logs = _debug_stdout.get_logs() + _debug_stderr.get_logs()
+            # Sort by timestamp and keep last 100
+            logs.sort(key=lambda x: x["ts"])
+            logs = logs[-100:]
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "enabled": _cache.get("logs_enabled", False),
+                "count": len(logs),
+                "logs": logs,
+            }, indent=2).encode())
 
         else:
             super().do_GET()
