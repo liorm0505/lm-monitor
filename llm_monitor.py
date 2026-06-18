@@ -123,11 +123,23 @@ _SCRIPT_MTIME_START = os.path.getmtime(_SCRIPT_PATH)
 
 
 # ──────────────────────────────────────────────
-# LM Studio log path — macOS default location
+# LM Studio log path — macOS default location (v0.3+)
 # ──────────────────────────────────────────────
-LM_STUDIO_LOG_PATH = os.path.expanduser(
-    "~/Library/Application Support/lm-studio/logs/server.log"
-)
+LM_STUDIO_LOG_DIR = os.path.expanduser("~/.lmstudio/server-logs")
+
+
+def _find_log_file():
+    """Find the most recent server log file in ~/.lmstudio/server-logs/"""
+    if not os.path.isdir(LM_STUDIO_LOG_DIR):
+        return None
+    files = [f for f in os.listdir(LM_STUDIO_LOG_DIR) if f.endswith(('.log', '.txt'))]
+    if not files:
+        return None
+    # Return the most recently modified file
+    return os.path.join(LM_STUDIO_LOG_DIR, max(files, key=lambda f: os.path.getmtime(os.path.join(LM_STUDIO_LOG_DIR, f))))
+
+
+LM_STUDIO_LOG_PATH = _find_log_file()
 
 
 # ──────────────────────────────────────────────
