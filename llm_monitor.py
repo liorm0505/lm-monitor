@@ -32,6 +32,37 @@ from datetime import datetime
 # ──────────────────────────────────────────────
 _START_TIME = time.time()
 
+
+# ──────────────────────────────────────────────
+# Git version info — resolves commit hash & timestamp
+# ──────────────────────────────────────────────
+
+def _get_git_info():
+    """Return (short_hash, commit_timestamp) from git log, or ('—', '—') if not a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%h %ci"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(_SCRIPT_PATH) or "."
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split()
+            return parts[0], parts[1]  # short_hash, ISO timestamp
+    except Exception:
+        pass
+    return "—", "—"
+
+
+def _uptime_str():
+    """Return human-readable uptime string."""
+    elapsed = int(time.time() - _START_TIME)
+    if elapsed < 60:
+        return f"{elapsed}s ago"
+    elif elapsed < 3600:
+        return f"{elapsed // 60}m ago"
+    else:
+        return f"{elapsed // 3600}h {(elapsed % 3600) // 60}m ago"
+
 # ──────────────────────────────────────────────
 # Configuration — edit these if needed
 # ──────────────────────────────────────────────
@@ -188,6 +219,24 @@ def _get_cached_lm_stats():
 def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_online, lm_gen_speed, lm_detail, lm_ttft):
     timestamp = datetime.now().strftime("%H:%M:%S")
     dot_color = "#34c759" if lm_online else "#ff3b30"
+    commit_hash, commit_ts = _get_git_info()
+    uptime = _uptime_str()
+
+    # Format commit time as relative ("2 min ago", "3 days ago", etc.)
+    try:
+        from datetime import timezone
+        commit_dt = datetime.fromisoformat(commit_ts)
+        age_seconds = int(time.time() - commit_dt.timestamp())
+        if age_seconds < 60:
+            commit_age = f"{age_seconds}s ago"
+        elif age_seconds < 3600:
+            commit_age = f"{age_seconds // 60}m ago"
+        elif age_seconds < 86400:
+            commit_age = f"{age_seconds // 3600}h ago"
+        else:
+            commit_age = f"{age_seconds // 86400}d ago"
+    except Exception:
+        commit_age = "—"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -209,6 +258,10 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
   .refresh-btn {{ position: fixed; bottom: 20px; right: 20px; background: #007aff; color: white; border: none; padding: 14px; border-radius: 50%; font-size: 22px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }}
   .footer {{ text-align: center; color: #555; font-size: 0.7em; margin-top: 28px; line-height: 1.6; }}
   .ttft-value {{ font-size: 1.6em; font-weight: 600; color: #ff9f0a; }}
+  .status-bar {{ display: flex; justify-content: center; align-items: center; gap: 12px; padding: 8px 12px; margin-top: 20px; border-radius: 10px; background: #1e1e1e; border: 1px solid #333; }}
+  .status-bar span {{ font-size: 0.75em; color: #888; }}
+  .status-bar .commit {{ color: #64d2ff; font-family: 'SF Mono', 'Fira Code', monospace; font-weight: 600; }}
+  .status-bar .uptime {{ color: #34c759; }}
 </style>
 </head>
 <body>
@@ -240,6 +293,16 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
   <div class="footer">
     Last updated: {timestamp} · LM Studio stats refresh every {CACHE_TTL}s<br>
     Auto-refresh page with ↻ button below
+  </div>
+
+  <div class="status-bar">
+    <span class="commit">{commit_hash}</span>
+    <span>·</span>
+    <span>{commit_age} ago</span>
+    <span>·</span>
+    <span class="uptime">{uptime}</span>
+    <span>·</span>
+    <span>● running</span>
   </div>
 
   <button class="refresh-btn" onclick="location.reload()">↻</button>
