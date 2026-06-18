@@ -1,6 +1,6 @@
 # LM Monitor Dashboard
 
-Lightweight Python HTTP dashboard for monitoring macOS Memory Pressure, RAM usage, and LM Studio inference speed (tokens/sec + TTFT) remotely via iPhone.
+Lightweight Python HTTP dashboard for monitoring macOS Memory Pressure, RAM usage, and LM Studio inference speed (tokens/sec + total latency) remotely via iPhone.
 
 ## Quick Install on Mac Mini M4 Pro
 
@@ -56,13 +56,22 @@ ipconfig getifaddr en1   # Ethernet
 |--------|-------------|
 | **Memory Pressure** | macOS memory pressure state (Low/Medium/High) |
 | **RAM Usage** | Current RAM usage percentage + GB available/total |
-| **Prompt Processing (TTFT)** | Time from request to first token — how fast the model reads & processes your prompt |
-| **Generation Speed** | Tokens/sec after first token — how fast the model generates output |
+| **Total Latency** | Time from request to complete response — what you actually experience |
+| **Generation Speed** | Tokens/sec — how fast the model generates output |
+
+## How We Measure
+
+We probe LM Studio with a short non-streaming request (`"stream": false`). This is important because:
+
+- **LM Studio prioritizes non-streaming requests** over streaming ones
+- With concurrency=1, a streaming test ping would get queued behind your actual chat requests → inflated numbers
+- The response includes `usage` data (prompt_tokens, completion_tokens) and we measure elapsed time via `response.elapsed`
+- Total latency = prompt processing + generation combined (the real-world number that matters)
 
 ## What Each Metric Tells You
 
-- **TTFT (Time to First Token):** High TTFT means the model is slow at *reading* your prompt. This is usually dominated by context length, model size, and CPU/GPU offload settings in LM Studio.
-- **Generation Speed:** Low gen speed means the model is slow at *writing* tokens. On Apple Silicon this is typically memory-bandwidth bound — faster with smaller models or less GPU offload.
+- **Total Latency:** How long you wait from sending a message to getting the full response. Lower is better — dominated by model size, GPU offload, and RAM pressure.
+- **Generation Speed:** Tokens per second during output. On Apple Silicon this is typically memory-bandwidth bound — faster with smaller models or less GPU offload.
 
 ## Configuration
 

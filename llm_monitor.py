@@ -164,13 +164,18 @@ def _get_ram_usage():
 
 
 def _ping_lm_studio():
-    """Fire a streaming inference request and measure both:
+    """Probe LM Studio using a non-streaming request.
     
-    • Time to First Token (TTFT) — prompt processing time in ms
-    • Generation Speed — tokens/sec
+    Why non-streaming? LM Studio prioritizes non-streaming completions over
+    streaming ones. With concurrency=1, our streaming test ping would get
+    queued behind your actual chat requests, giving inflated numbers.
     
-    Uses SSE streaming so we can capture the first token arrival time.
-    Called once every CACHE_TTL seconds; results are cached for page views.
+    The response includes usage data (prompt_tokens, completion_tokens) and
+    we can measure total elapsed time via response.elapsed. This gives us:
+      • Total latency = prompt processing + generation (what you actually see)
+      • Generation speed = completion_tokens / elapsed_time
+    
+    Called once every CACHE_TTL seconds; results cached for page views.
     """
     try:
         payload = {
@@ -178,77 +183,38 @@ def _ping_lm_studio():
             "messages": [{"role": "user", "content": "Say 'OK'"}],
             "max_tokens": 5,
             "temperature": 0.1,
-            "stream": True,               # Enable streaming for TTFT measurement
+            "stream": False,              # Non-streaming → LM Studio prioritizes it
         }
-        
-        start_time = time.time()
-        first_token_time = None
-        total_tokens = 0
         
         response = requests.post(
             f"{LM_STUDIO_URL}/v1/chat/completions",
             json=payload,
             timeout=30,
-            stream=True
+            stream=False
         )
         
-        elapsed_total = time.time() - start_time
-        
-        if response.status_code == 200:
-            # Parse SSE stream manually to capture first token time
-            for line in response.iter_lines():
-                if line:
-                    text = line.decode("utf-8")
-                    # SSE lines look like: data: {"choices":[{"delta":{"content":"..."}}]}
-                    if text.startswith("data: "):
-                        data_str = text[6:]  # Remove "data: " prefix
-                        if data_str.strip() == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                            choices = chunk.get("choices", [])
-                            for choice in choices:
-                                delta = choice.get("delta", {})
-                                content = delta.get("content") or delta.get("text")
-                                if content and first_token_time is None:
-                                    first_token_time = (time.time() - start_time) * 1000  # ms
-                                total_tokens += 1
-                        except json.JSONDecodeError:
-                            continue
-        
-        # Build results — separate prompt processing (TTFT) from generation speed
         if not response.ok:
             return False, "Offline", f"Status: {response.status_code}", "—"
         
+        data = response.json()
+        elapsed = response.elapsed.total_seconds()
+        usage = data.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        
+        if not completion_tokens or elapsed <= 0:
+            return True, "—", f"Response received but no tokens (elapsed: {elapsed:.3f}s)", "—"
+        
+        # Total latency = prompt processing + generation combined
+        total_ms = elapsed * 1000
+        gen_speed = completion_tokens / elapsed
+        
         detail_parts = []
-        ttft_str = "—"
-        gen_speed_str = "—"
+        detail_parts.append(f"{completion_tokens} tokens in {elapsed:.2f}s ({gen_speed:.1f} tok/s)")
+        if prompt_tokens:
+            detail_parts.append(f"Prompt: {prompt_tokens} tokens")
         
-        # TTFT = prompt processing time (ms)
-        if first_token_time is not None:
-            ttft_str = f"{first_token_time:.0f} ms"
-            detail_parts.append(f"TTFT: {ttft_str}")
-        
-        # Generation speed = tokens/sec during generation phase ONLY (after first token)
-        if total_tokens > 0 and elapsed_total > 0:
-            if first_token_time is not None:
-                gen_duration = elapsed_total - (first_token_time / 1000.0)
-                if gen_duration > 0:
-                    gen_speed = total_tokens / gen_duration
-                    gen_speed_str = f"{gen_speed:.1f} tok/s"
-                    detail_parts.append(f"{total_tokens} tokens in {gen_duration:.2f}s ({gen_speed_str})")
-                else:
-                    gen_speed_str = f"{total_tokens/elapsed_total:.1f} tok/s"
-                    detail_parts.append(f"{total_tokens} tokens in ~{elapsed_total:.3f}s ({gen_speed_str})")
-            else:
-                gen_speed = total_tokens / elapsed_total
-                gen_speed_str = f"{gen_speed:.1f} tok/s"
-                detail_parts.append(f"{total_tokens} tokens in {elapsed_total:.2f}s ({gen_speed_str})")
-        
-        if not detail_parts:
-            detail_parts.append("Waiting for response...")
-        
-        return True, gen_speed_str, ", ".join(detail_parts), ttft_str
+        return True, f"{gen_speed:.1f} tok/s", ", ".join(detail_parts), f"{total_ms:.0f} ms"
     
     except Exception as e:
         return False, "Error", str(e)
@@ -340,9 +306,9 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
   </div>
 
   <div class="card">
-    <h2><span class="status-dot"></span>Prompt Processing (TTFT)</h2>
+    <h2><span class="status-dot"></span>Total Latency</h2>
     <div class="ttft-value">{lm_ttft}</div>
-    <div class="sub">Time from request to first token — how fast the model reads & processes your prompt</div>
+    <div class="sub">Time from request to complete response — what you actually experience</div>
   </div>
 
   <div class="card">
