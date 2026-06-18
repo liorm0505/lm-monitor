@@ -169,6 +169,13 @@ def _read_lm_studio_logs():
     """
     results = []
     
+    # Early exit if no log file was found during startup
+    if LM_STUDIO_LOG_PATH is None:
+        _cache["log_file_exists"] = False
+        print("📋 LM Studio log directory not found — skipping scan. "
+              "Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
+        return results
+    
     # Check if log file exists (cached on first run)
     if _cache["log_file_exists"] is False:
         print("📋 LM Studio log not found — skipping scan. "
