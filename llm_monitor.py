@@ -123,23 +123,17 @@ _SCRIPT_MTIME_START = os.path.getmtime(_SCRIPT_PATH)
 
 
 # ──────────────────────────────────────────────
-# LM Studio log path — macOS default location (v0.3+)
+# LM Studio log path — macOS default location (v0.4+)
 # ──────────────────────────────────────────────
-LM_STUDIO_LOG_DIR = os.path.expanduser("~/.lmstudio/server-logs")
+LM_STUDIO_LOG_PATH = os.path.expanduser("~/Library/Logs/LM Studio/main.log")
 
 
-def _find_log_file():
-    """Find the most recent server log file in ~/.lmstudio/server-logs/"""
-    if not os.path.isdir(LM_STUDIO_LOG_DIR):
-        return None
-    files = [f for f in os.listdir(LM_STUDIO_LOG_DIR) if f.endswith(('.log', '.txt'))]
-    if not files:
-        return None
-    # Return the most recently modified file
-    return os.path.join(LM_STUDIO_LOG_DIR, max(files, key=lambda f: os.path.getmtime(os.path.join(LM_STUDIO_LOG_DIR, f))))
-
-
-LM_STUDIO_LOG_PATH = _find_log_file()
+def _log_file_exists():
+    """Check if the log file exists and is readable."""
+    try:
+        return os.path.isfile(LM_STUDIO_LOG_PATH)
+    except (TypeError, ValueError):
+        return False
 
 
 # ──────────────────────────────────────────────
@@ -186,7 +180,7 @@ def _read_lm_studio_logs():
         with open(LM_STUDIO_LOG_PATH, "r", errors="replace") as f:
             lines = f.readlines()
         
-        print(f"📋 Read {len(lines)} lines from server.log")
+        print(f"📋 Read {len(lines)} lines from main.log")
         
         # Process lines in reverse (newest first) to find completions quickly
         for line in reversed(lines[-500:]):  # Last 500 lines
