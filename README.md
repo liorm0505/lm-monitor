@@ -56,22 +56,30 @@ ipconfig getifaddr en1   # Ethernet
 |--------|-------------|
 | **Memory Pressure** | macOS memory pressure state (Low/Medium/High) |
 | **RAM Usage** | Current RAM usage percentage + GB available/total |
-| **Total Latency** | Time from request to complete response — what you actually experience |
-| **Generation Speed** | Tokens/sec — how fast the model generates output |
+| **Avg Generation Speed** | Tokens/sec averaged over last 10 real requests from LM Studio logs |
+| **Avg Prompt Processing** | Milliseconds to process the prompt, averaged over last 10 requests |
 
 ## How We Measure
 
-We probe LM Studio with a short non-streaming request (`"stream": false`). This is important because:
+The dashboard reads **actual LM Studio server logs** (not test pings) to get real-world metrics:
 
-- **LM Studio prioritizes non-streaming requests** over streaming ones
-- With concurrency=1, a streaming test ping would get queued behind your actual chat requests → inflated numbers
-- The response includes `usage` data (prompt_tokens, completion_tokens) and we measure elapsed time via `response.elapsed`
-- Total latency = prompt processing + generation combined (the real-world number that matters)
+- Logs are stored at `~/.lmstudio/server-logs/YYYY-MM/YYYY-MM-DD.N.log`
+- Each chat completion request produces timing lines like:
+  ```
+  prompt eval time = 58880.48 ms / 19027 tokens (323.15 tokens per second)
+  eval time =    3486.10 ms /   113 tokens (32.41 tokens per second)
+  ```
+- The script parses these lines, groups metrics by task ID, and calculates averages over the last 10 requests
 
-## What Each Metric Tells You
+### Required LM Studio Settings
 
-- **Total Latency:** How long you wait from sending a message to getting the full response. Lower is better — dominated by model size, GPU offload, and RAM pressure.
-- **Generation Speed:** Tokens per second during output. On Apple Silicon this is typically memory-bandwidth bound — faster with smaller models or less GPU offload.
+You **must** enable **"Verbose Server Logs"** in LM Studio:
+1. Open LM Studio → **Settings** → **Developer**
+2. Toggle **"Verbose Logging"** ON
+3. Set **"File Logging Mode"** to **"Succinct"** (or any mode)
+4. Restart the LM Studio server
+
+Without this, the log files won't contain the timing data needed for metrics.
 
 ## Configuration
 
