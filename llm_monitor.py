@@ -495,7 +495,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
     <span>● running</span>
   </div>
 
-  <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()" data-state="{{ 'on' if _cache.get('debug_enabled', False) else 'off' }}">🐛</button>
+  <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()" data-state="{{ 'on' if _cache.get('logs_enabled') else 'off' }}">🐛</button>
 
   <script>
     // Toggle debug logging on/off
