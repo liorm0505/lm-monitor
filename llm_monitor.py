@@ -561,8 +561,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "enabled": _cache.get("logs_enabled", False),
                 "count": len(logs),
                 "recent_requests": len(_cache.get("recent_requests", [])),
-                "log_file_exists": _cache.get("log_file_exists"),
-                "lm_studio_log_path": LM_STUDIO_LOG_PATH,
+                "log_dir_exists": _cache.get("log_dir_exists"),
+                "lm_studio_log_dir": LM_STUDIO_LOG_DIR,
                 "logs": logs,
             }, indent=2).encode())
 
@@ -575,20 +575,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import psutil
+    import psutil as _psutil
     
     print(f"🚀 Dashboard running at http://<YOUR_MAC_IP>:{PORT}")
-    print(f"   Reading LM Studio logs from: {LM_STUDIO_LOG_PATH}")
+    print(f"   Reading LM Studio logs from: {LM_STUDIO_LOG_DIR}/")
     print(f"   Log scan every {CACHE_TTL}s · Running avg over last {AVG_WINDOW} requests")
     print("Press Ctrl+C to stop.")
     
-    # Check if log file exists on startup
-    if os.path.exists(LM_STUDIO_LOG_PATH):
-        _cache["log_file_exists"] = True
-        print(f"✅ Found LM Studio log: {LM_STUDIO_LOG_PATH}")
+    # Check if log directory exists on startup
+    if os.path.isdir(LM_STUDIO_LOG_DIR):
+        _cache["log_dir_exists"] = True
+        print(f"✅ Found LM Studio log dir: {LM_STUDIO_LOG_DIR}/")
     else:
-        _cache["log_file_exists"] = False
-        print(f"⚠️  LM Studio log not found at: {LM_STUDIO_LOG_PATH}")
+        _cache["log_dir_exists"] = False
+        print(f"⚠️  LM Studio log dir not found at: {LM_STUDIO_LOG_DIR}/")
         print("   Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
     
     try:
