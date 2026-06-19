@@ -26,6 +26,12 @@ import sys
 from datetime import datetime
 from io import StringIO
 
+# Guarded psutil import — available in module scope for all functions
+try:
+    import psutil
+except ImportError:
+    psutil = None  # type: ignore[name-defined]
+
 # ──────────────────────────────────────────────
 # Startup timestamp — used for uptime tracking
 # ──────────────────────────────────────────────
@@ -368,6 +374,8 @@ def _get_memory_pressure():
 
 def _get_ram_usage():
     """Return RAM percentage, total GB, available GB."""
+    if psutil is None:
+        return "—", "—", "—"
     mem = psutil.virtual_memory()
     return mem.percent, mem.total / (1024**3), mem.available / (1024**3)
 
@@ -640,8 +648,6 @@ def _start_log_server() -> None:
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import psutil as _psutil
-    
     print(f"🚀 Dashboard running at http://<YOUR_MAC_IP>:{PORT}")
     print(f"   Reading LM Studio logs from: {LM_STUDIO_LOG_DIR}/")
     print(f"   Log scan every {CACHE_TTL}s · Running avg over last {AVG_WINDOW} requests")
