@@ -574,6 +574,71 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 # Entry point
 # ──────────────────────────────────────────────
 
+# ──────────────────────────────────────────────
+# Crash handler & debug logging
+# ──────────────────────────────────────────────
+
+LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+def log_debug(msg: str) -> None:
+    """Append a timestamped message to logs/debug.log"""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(os.path.join(LOGS_DIR, "debug.log"), "a") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+def handle_crash(exc_type, exc_value, exc_traceback) -> None:
+    """Write unhandled exceptions to logs/crash.log"""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    with open(os.path.join(LOGS_DIR, "crash.log"), "a") as f:
+        f.write(f"--- Crashed at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        f.write("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+        f.write("\n")
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = handle_crash
+
+# ──────────────────────────────────────────────
+# Background log HTTP server (survives dashboard crashes)
+# ──────────────────────────────────────────────
+
+def _start_log_server() -> None:
+    """Start a background http.server on port 8081 serving the logs/ folder."""
+    import subprocess
+    import socket
+    
+    # Check if already running on port 8081
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex(("127.0.0.1", 8081))
+    sock.close()
+    if result == 0:
+        log_debug("Log server already running on port 8081")
+        return
+    
+    # Not running — start it detached from the dashboard process
+    pid_file = os.path.join(LOGS_DIR, "log_server.pid")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "http.server", "8081"],
+        cwd=LOGS_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    # Save PID so stop.sh can kill it cleanly
+    with open(pid_file, "w") as f:
+        f.write(str(proc.pid))
+    log_debug(f"Log server started on port 8081 (PID {proc.pid})")
+
+# ──────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────
+
 if __name__ == "__main__":
     import psutil as _psutil
     
@@ -590,6 +655,10 @@ if __name__ == "__main__":
         _cache["log_dir_exists"] = False
         print(f"⚠️  LM Studio log dir not found at: {LM_STUDIO_LOG_DIR}/")
         print("   Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
+    
+    # Start the background log server (survives dashboard crashes)
+    _start_log_server()
+    print(f"📂 Log server started on port 8081 — I can read crash/debug logs remotely")
     
     try:
         with socketserver.TCPServer(("", PORT), Handler) as httpd:

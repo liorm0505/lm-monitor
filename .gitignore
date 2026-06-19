@@ -12,3 +12,6 @@ __pycache__/
 .env
 *.local
 *.log
+
+# Runtime logs (written by the script, read remotely)
+logs/
