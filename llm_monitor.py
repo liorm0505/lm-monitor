@@ -123,17 +123,31 @@ _SCRIPT_MTIME_START = os.path.getmtime(_SCRIPT_PATH)
 
 
 # ──────────────────────────────────────────────
-# LM Studio log path — macOS default location (v0.4+)
+# LM Studio log path — macOS v0.4+ directory structure
+# Logs are organized by month: ~/.lmstudio/server-logs/YYYY-MM/
 # ──────────────────────────────────────────────
-LM_STUDIO_LOG_PATH = os.path.expanduser("~/Library/Logs/LM Studio/main.log")
+LM_STUDIO_LOG_DIR = os.path.expanduser("~/.lmstudio/server-logs")
+
+
+def _find_log_files():
+    """Find all log files in the current month's directory."""
+    import datetime
+    
+    now = datetime.datetime.now()
+    month_dir = os.path.join(LM_STUDIO_LOG_DIR, now.strftime("%Y-%m"))
+    
+    if not os.path.isdir(month_dir):
+        return []
+    
+    # Return all .log files sorted by name (newest first)
+    files = [f for f in os.listdir(month_dir) if f.endswith('.log')]
+    files.sort(reverse=True)  # Newest first (YYYY-MM-DD.N.log)
+    return [os.path.join(month_dir, f) for f in files]
 
 
 def _log_file_exists():
-    """Check if the log file exists and is readable."""
-    try:
-        return os.path.isfile(LM_STUDIO_LOG_PATH)
-    except (TypeError, ValueError):
-        return False
+    """Check if any log files exist."""
+    return len(_find_log_files()) > 0
 
 
 # ──────────────────────────────────────────────
@@ -152,130 +166,152 @@ _cache = {
 
 
 # ──────────────────────────────────────────────
-# Data collection — read LM Studio server.log
+# Data collection — parse LM Studio text-based logs
 # ──────────────────────────────────────────────
 
 def _read_lm_studio_logs():
-    """Read and parse the last lines of LM Studio's server.log.
+    """Read and parse LM Studio's server logs (text format).
     
-    Returns a list of dicts, each representing a parsed /v1/chat/completions response.
-    Each dict contains: timestamp, prompt_tokens, completion_tokens, duration_ms, status
+    Extracts metrics from 'slot print_timing' lines:
+    - prompt eval time = XXXX ms / YYYY tokens (ZZZ.ZZ t/s)
+    - eval time = XXXX ms / YY tokens (BB.BB t/s)
+    - total time = XXXX ms / ZZZZ tokens
+    
+    Returns list of dicts with: task_id, prompt_tokens, completion_tokens, 
+                                 prompt_time_ms, eval_time_ms, gen_speed_tps
     """
+    import re
+    
     results = []
     
-    # Early exit if no log file was found during startup
-    if LM_STUDIO_LOG_PATH is None:
-        _cache["log_file_exists"] = False
-        print("📋 LM Studio log directory not found — skipping scan. "
+    # Early exit if no log files found
+    if _cache["log_file_exists"] is False:
+        print("📋 No LM Studio log files found — skipping scan. "
               "Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
         return results
     
-    # Check if log file exists (cached on first run)
-    if _cache["log_file_exists"] is False:
-        print("📋 LM Studio log not found — skipping scan. "
-              "Enable 'Verbose Server Logs' in LM Studio settings.")
+    # Find all log files for current month
+    log_files = _find_log_files()
+    if not log_files:
+        print("📋 No log files in current month directory — skipping scan.")
         return results
     
-    try:
-        with open(LM_STUDIO_LOG_PATH, "r", errors="replace") as f:
-            lines = f.readlines()
-        
-        print(f"📋 Read {len(lines)} lines from main.log")
-        
-        # Process lines in reverse (newest first) to find completions quickly
-        for line in reversed(lines[-500:]):  # Last 500 lines
-            line = line.strip()
-            if not line:
-                continue
-            
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            
-            # Filter for chat completion responses
-            path = entry.get("path", "") or entry.get("url", "")
-            if "/v1/chat/completions" not in path:
-                continue
-            
-            status = entry.get("status", 0)
-            if status != 200:
-                continue
-            
-            # Extract metrics from response
-            response_data = entry.get("response", {})
-            usage = response_data.get("usage", {})
-            
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
-            
-            if not completion_tokens:
-                continue
-            
-            # Duration from the log entry
-            duration_ms = entry.get("duration_ms", 0) or entry.get("response_time_ms", 0)
-            
-            # Timestamp from the log entry
-            ts = entry.get("timestamp", "") or entry.get("time", "")
-            
-            request_data = entry.get("request", {})
-            model = request_data.get("model", "")
-            
-            req_entry = {
-                "timestamp": ts,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": usage.get("total_tokens", prompt_tokens + completion_tokens),
-                "duration_ms": duration_ms,
-                "model": model,
-                "status": status,
-            }
-            
-            results.append(req_entry)
-            print(f"  ✅ Parsed: {completion_tokens} tokens, {duration_ms}ms, model={model}")
+    print(f"📋 Found {len(log_files)} log file(s) to scan")
     
-    except FileNotFoundError:
-        _cache["log_file_exists"] = False
-        print("⚠️  LM Studio log file not found at:", LM_STUDIO_LOG_PATH)
-        print("   Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
-    except PermissionError:
-        print(f"❌ Permission denied reading: {LM_STUDIO_LOG_PATH}")
-        _cache["log_file_exists"] = False
-    except Exception as e:
-        print(f"❌ Error reading log: {e}")
+    # Regex patterns for extracting metrics
+    prompt_re = re.compile(
+        r'prompt\s+eval\s+time\s+=\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tokens.*?(\d+\.\d+)\s+tokens?\s+per\s+second'
+    )
+    eval_re = re.compile(
+        r'eval\s+time\s+=\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tokens.*?(\d+\.\d+)\s+tokens?\s+per\s+second'
+    )
+    task_re = re.compile(r'task\s+(\d+)')
     
+    # Process each log file (newest first)
+    total_lines = 0
+    for log_file in log_files[:3]:  # Scan last 3 files max
+        try:
+            with open(log_file, "r", errors="replace") as f:
+                lines = f.readlines()
+            total_lines += len(lines)
+            
+            # Track metrics by task ID (group prompt eval + eval time together)
+            task_metrics = {}
+            
+            for line in lines[-1000:]:  # Last 1000 lines per file
+                line = line.strip()
+                if not line or 'slot print_timing' not in line:
+                    continue
+                
+                # Extract task ID
+                task_match = task_re.search(line)
+                if not task_match:
+                    continue
+                task_id = task_match.group(1)
+                
+                # Check for prompt eval time
+                prompt_match = prompt_re.search(line)
+                if prompt_match:
+                    prompt_time_ms = float(prompt_match.group(1))
+                    prompt_tokens = int(prompt_match.group(2))
+                    prompt_tps = float(prompt_match.group(3))
+                    
+                    if task_id not in task_metrics:
+                        task_metrics[task_id] = {}
+                    task_metrics[task_id]['prompt_time_ms'] = prompt_time_ms
+                    task_metrics[task_id]['prompt_tokens'] = prompt_tokens
+                    task_metrics[task_id]['prompt_tps'] = prompt_tps
+                
+                # Check for eval time (generation)
+                eval_match = eval_re.search(line)
+                if eval_match:
+                    eval_time_ms = float(eval_match.group(1))
+                    completion_tokens = int(eval_match.group(2))
+                    eval_tps = float(eval_match.group(3))
+                    
+                    if task_id not in task_metrics:
+                        task_metrics[task_id] = {}
+                    task_metrics[task_id]['eval_time_ms'] = eval_time_ms
+                    task_metrics[task_id]['completion_tokens'] = completion_tokens
+                    task_metrics[task_id]['eval_tps'] = eval_tps
+            
+            # Extract complete results from grouped metrics
+            for task_id, metrics in task_metrics.items():
+                if 'prompt_tokens' in metrics and 'completion_tokens' in metrics:
+                    prompt_tokens = metrics['prompt_tokens']
+                    completion_tokens = metrics['completion_tokens']
+                    prompt_time_ms = metrics.get('prompt_time_ms', 0)
+                    eval_time_ms = metrics.get('eval_time_ms', 0)
+                    
+                    # Calculate generation speed (tokens/sec during generation phase)
+                    if eval_time_ms > 0:
+                        gen_speed = completion_tokens / (eval_time_ms / 1000.0)
+                    else:
+                        gen_speed = 0
+                    
+                    results.append({
+                        'task_id': task_id,
+                        'prompt_tokens': prompt_tokens,
+                        'completion_tokens': completion_tokens,
+                        'prompt_time_ms': prompt_time_ms,
+                        'eval_time_ms': eval_time_ms,
+                        'gen_speed_tps': gen_speed,
+                    })
+                    
+        except Exception as e:
+            print(f"⚠️  Error reading {log_file}: {e}")
+    
+    print(f"📋 Parsed {len(results)} completion requests from {total_lines} lines")
     return results
 
 
 def _calculate_averages(requests):
     """Calculate running averages from parsed completion requests.
     
-    Returns (avg_gen_speed, avg_duration_ms, detail_string, sample_count)
+    Returns (avg_gen_speed, avg_prompt_time_ms, detail_string, sample_count)
     """
     if not requests:
         return "—", "—", "No completion requests found in logs", 0
     
-    total_tokens = sum(r["completion_tokens"] for r in requests)
-    total_time = sum(r["duration_ms"] for r in requests)
+    # Use gen_speed_tps directly from logs (already calculated per-request)
+    speeds = [r["gen_speed_tps"] for r in requests if r["gen_speed_tps"] > 0]
+    prompt_times = [r["prompt_time_ms"] for r in requests if r["prompt_time_ms"] > 0]
     
-    if total_time <= 0:
-        gen_speed = "—"
-    else:
-        gen_speed = f"{total_tokens / (total_time / 1000):.1f} tok/s"
+    avg_gen_speed = f"{sum(speeds) / len(speeds):.1f} tok/s" if speeds else "—"
+    avg_prompt_time = sum(prompt_times) / len(prompt_times) if prompt_times else 0
     
-    avg_duration = total_time / len(requests)
-    
-    # Average prompt tokens
+    # Average token counts
     avg_prompt = sum(r["prompt_tokens"] for r in requests) / len(requests)
     avg_completion = sum(r["completion_tokens"] for r in requests) / len(requests)
     
     detail_parts = [
         f"{len(requests)} recent requests",
         f"Avg: {avg_prompt:.0f} prompt tokens → {avg_completion:.0f} completion tokens",
-        f"Total: {total_tokens} tokens in {total_time/1000:.1f}s ({gen_speed if isinstance(gen_speed, str) else '—'})",
+        f"Gen speed: {avg_gen_speed}",
+        f"Prompt processing: {avg_prompt_time:.0f} ms avg",
     ]
     
-    return gen_speed, avg_duration, ", ".join(detail_parts), len(requests)
+    return avg_gen_speed, avg_prompt_time, ", ".join(detail_parts), len(requests)
 
 
 def _get_cached_lm_stats():
@@ -291,7 +327,7 @@ def _get_cached_lm_stats():
         # Calculate averages over the last AVG_WINDOW requests
         window = _cache["recent_requests"][-AVG_WINDOW:] if len(_cache["recent_requests"]) >= AVG_WINDOW else _cache["recent_requests"]
         
-        gen_speed, avg_duration_ms, detail, count = _calculate_averages(window)
+        gen_speed, avg_prompt_time, detail, count = _calculate_averages(window)
         
         # Determine online status based on whether we found recent requests
         online = count > 0
@@ -300,7 +336,7 @@ def _get_cached_lm_stats():
             "lm_online": online,
             "lm_gen_speed": gen_speed,
             "lm_detail": detail,
-            "lm_ttft": f"{avg_duration_ms:.0f} ms" if avg_duration_ms != "—" else "—",
+            "lm_ttft": f"{avg_prompt_time:.0f} ms" if avg_prompt_time != "—" else "—",
             "lm_ts": now,
         })
         
