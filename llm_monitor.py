@@ -280,9 +280,13 @@ def _read_lm_studio_logs():
                         'prompt_tokens': prompt_tokens,
                         'completion_tokens': completion_tokens,
                         'prompt_time_ms': prompt_time_ms,
+                        'prompt_tps': metrics.get('prompt_tps', 0),   # tokens/sec during prompt processing
                         'eval_time_ms': eval_time_ms,
                         'gen_speed_tps': gen_speed,
                     })
+
+                if task_id in task_metrics and 'prompt_tps' in task_metrics[task_id] and task_metrics[task_id]['prompt_tps'] > 0:
+                    print(f"🔍 Task {task_id}: prompt={prompt_tokens} tok ({metrics['prompt_tps']:.0f} t/s) · gen={completion_tokens} tok ({gen_speed:.1f} t/s)")
                     
         except Exception as e:
             print(f"⚠️  Error reading {log_file}: {e}")
@@ -302,22 +306,23 @@ def _calculate_averages(requests):
     # Use gen_speed_tps directly from logs (already calculated per-request)
     speeds = [r["gen_speed_tps"] for r in requests if r["gen_speed_tps"] > 0]
     prompt_times = [r["prompt_time_ms"] for r in requests if r["prompt_time_ms"] > 0]
-    
+    prompt_tps_vals = [r["prompt_tps"] for r in requests if r["prompt_tps"] > 0]
+
     avg_gen_speed = f"{sum(speeds) / len(speeds):.1f} tok/s" if speeds else "—"
     avg_prompt_time = sum(prompt_times) / len(prompt_times) if prompt_times else 0
-    
+    avg_prompt_tps = f"{sum(prompt_tps_vals) / len(prompt_tps_vals):.0f} tok/s" if prompt_tps_vals else "—"
+
     # Average token counts
     avg_prompt = sum(r["prompt_tokens"] for r in requests) / len(requests)
     avg_completion = sum(r["completion_tokens"] for r in requests) / len(requests)
-    
+
     detail_parts = [
         f"{len(requests)} recent requests",
-        f"Avg: {avg_prompt:.0f} prompt tokens → {avg_completion:.0f} completion tokens",
-        f"Gen speed: {avg_gen_speed}",
-        f"Prompt processing: {avg_prompt_time:.0f} ms avg",
+        f"Context: {avg_prompt:.0f} tokens · Gen speed: {avg_gen_speed}",
+        f"Prompt processing: {avg_prompt_time:.0f} ms avg ({avg_prompt_tps})",
     ]
-    
-    return avg_gen_speed, avg_prompt_time, ", ".join(detail_parts), len(requests)
+
+    return avg_gen_speed, avg_prompt_time, avg_prompt_tps, avg_prompt, ", ".join(detail_parts), len(requests)
 
 
 def _get_cached_lm_stats():
@@ -333,22 +338,23 @@ def _get_cached_lm_stats():
         # Calculate averages over the last AVG_WINDOW requests
         window = _cache["recent_requests"][-AVG_WINDOW:] if len(_cache["recent_requests"]) >= AVG_WINDOW else _cache["recent_requests"]
         
-        gen_speed, avg_prompt_time, detail, count = _calculate_averages(window)
-        
+        gen_speed, avg_prompt_time, prompt_tps, avg_context, detail, count = _calculate_averages(window)
+
         # Determine online status based on whether we found recent requests
         online = count > 0
-        
+
         _cache.update({
             "lm_online": online,
             "lm_gen_speed": gen_speed,
             "lm_detail": detail,
             "lm_ttft": f"{avg_prompt_time:.0f} ms" if avg_prompt_time != "—" else "—",
+            "lm_prompt_tps": prompt_tps,
+            "lm_context_size": avg_context,
             "lm_ts": now,
         })
-        
-        print(f"📊 Stats updated: {count} requests in window, gen_speed={gen_speed}")
-    
-    return _cache["lm_online"], _cache["lm_gen_speed"], _cache["lm_detail"], _cache["lm_ttft"]
+
+        print(f"📊 Stats updated: {count} requests in window, gen_speed={gen_speed}, prompt_speed={prompt_tps}, context={avg_context:.0f} tokens")
+    return _cache["lm_online"], _cache["lm_gen_speed"], _cache["lm_detail"], _cache["lm_ttft"], _cache["lm_prompt_tps"], _cache["lm_context_size"]
 
 
 # ──────────────────────────────────────────────
@@ -384,7 +390,7 @@ def _get_ram_usage():
 # HTML generation — responsive mobile dashboard
 # ──────────────────────────────────────────────
 
-def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_online, lm_gen_speed, lm_detail, lm_ttft):
+def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context):
     timestamp = datetime.now().strftime("%H:%M:%S")
     dot_color = "#34c759" if lm_online else "#ff3b30"
     commit_hash, commit_ts = _get_git_info()
@@ -462,6 +468,18 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
     <div class="sub">Average duration of last {AVG_WINDOW} completion requests (includes prompt + generation)</div>
   </div>
 
+  <div class="card">
+    <h2><span class="status-dot"></span>Avg Prompt Processing Speed</h2>
+    <div class="value">{lm_prompt_tps}</div>
+    <div class="sub">Tokens/sec during prompt evaluation phase</div>
+  </div>
+
+  <div class="card">
+    <h2><span class="status-dot"></span>Avg Context Size</h2>
+    <div class="value">{lm_context:.0f} tokens</div>
+    <div class="sub">Average prompt token count over last {AVG_WINDOW} requests</div>
+  </div>
+
   <div class="footer">
     Last updated: {timestamp} · LM Studio log scan every {CACHE_TTL}s<br>
     Auto-refresh page with ↻ button below
@@ -511,11 +529,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.path == "/":
             pressure, p_color = _get_memory_pressure()
             ram_pct, ram_total, ram_avail = _get_ram_usage()
-            lm_online, lm_gen_speed, lm_detail, lm_ttft = _get_cached_lm_stats()
+            lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context = _get_cached_lm_stats()
 
             html = generate_html(
                 pressure, p_color, ram_pct, ram_total, ram_avail,
-                lm_online, lm_gen_speed, lm_detail, lm_ttft
+                lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context
             )
             self.send_response(200)
             self.send_header("Content-type", "text/html")
@@ -533,6 +551,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     "online": _cache["lm_online"],
                     "gen_speed": _cache["lm_gen_speed"],
                     "avg_ttft_ms": _cache["lm_ttft"],
+                    "prompt_speed": _cache.get("lm_prompt_tps", "—"),
+                    "context_size": f"{_cache.get('lm_context_size', 0):.0f} tokens",
                     "detail": _cache["lm_detail"],
                     "recent_requests_count": len(_cache.get("recent_requests", [])),
                 },
