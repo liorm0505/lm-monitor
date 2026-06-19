@@ -495,13 +495,13 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
     <span>● running</span>
   </div>
 
-  <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()">🐛</button>
+  <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()" data-state="{{ 'on' if _cache.get('debug_enabled', False) else 'off' }}">🐛</button>
 
   <script>
     // Toggle debug logging on/off
     function toggleDebug() {{
       const btn = document.getElementById('debugBtn');
-      const isOn = btn.style.background === 'rgb(255, 69, 58)';
+      const isOn = btn.dataset.state === 'on';
       fetch('/debug/toggle?enable=' + (isOn ? '0' : '1'))
         .then(() => {{ location.reload(); }})
         .catch(() => {{}});
