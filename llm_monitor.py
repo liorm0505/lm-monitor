@@ -398,6 +398,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
     logs_enabled = _cache.get("logs_enabled", False)
     print(f"🐛 DEBUG RENDER: logs_enabled={logs_enabled} (raw cache={_cache.get('logs_enabled', 'MISSING')!r})")
     dbg_color = "#ff453a" if logs_enabled else "#8e8e93"  # Red when on, gray when off
+    _state = "on" if logs_enabled else "off"
 
     # Format commit time as relative ("2 min ago", "3 days ago", etc.)
     try:
@@ -496,7 +497,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
     <span>● running</span>
   </div>
 
-  <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()" data-state="{{ 'on' if _cache.get('logs_enabled') else 'off' }}">🐛</button>
+  <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()" data-state="{_state}">🐛</button>
 
   <script>
     // Toggle debug logging on/off
