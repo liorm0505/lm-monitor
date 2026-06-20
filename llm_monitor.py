@@ -363,37 +363,58 @@ def _get_cached_lm_stats():
 # ──────────────────────────────────────────────
 
 def _get_memory_pressure():
-    """Query macOS memory pressure via sysctl."""
+    """Query macOS memory pressure via `memory_pressure` CLI (Apple Silicon & Intel)."""
     try:
+        # `memory_pressure` CLI exists on macOS Monterey+ and works on both Apple Silicon and Intel
         result = subprocess.run(
-            ["sysctl", "-n", "vm.page_pressure"],
-            capture_output=True, text=True
+            ["memory_pressure", "json"],
+            capture_output=True, text=True, timeout=5
         )
-        raw_stdout = repr(result.stdout)
-        stderr_val = result.stderr.strip() if result.stderr else "(empty)"
-        log_debug(f"MEM_PRESSURE: sysctl exit_code={result.returncode}, stdout={raw_stdout}, stderr={stderr_val}")
 
-        status = result.stdout.strip()
-        if not status:
-            log_debug("MEM_PRESSURE: ⚠️ empty string — defaulting to '—'")
-            return "—", "#888888"
+        if result.returncode != 0:
+            log_debug(f"MEM_PRESSURE: memory_pressure exit={result.returncode}")
+            return _get_memory_pressure_fallback()
 
-        # Try parsing as integer for Apple Silicon (which may return 0/1/2+)
-        try:
-            val = int(status)
-            log_debug(f"MEM_PRESSURE: parsed int={val}")
-        except ValueError:
-            log_debug(f"MEM_PRESSURE: ⚠️ not an integer, value='{status}'")
+        import json as _json_mod
+        data = _json_mod.loads(result.stdout.strip())
 
-        if status == "0":
+        # The CLI outputs systemwide_pressure_level: "Low"/"Medium"/"High" or numeric codes
+        level_raw = data.get("systemwide_pressure_level", None)
+        log_debug(f"MEM_PRESSURE: raw={repr(level_raw)}, full_output_keys={list(data.keys())[:10]}")
+
+        if level_raw == 0 or str(level_raw).lower() == "low":
             return "Low", "#34c759"       # Green
-        elif status == "1":
+        elif level_raw == 1 or str(level_raw).lower() == "medium":
             return "Medium", "#ff9f0a"    # Yellow
         else:
-            log_debug(f"MEM_PRESSURE: falling through to High (value='{status}')")
             return "High", "#ff3b30"      # Red
+
+    except FileNotFoundError:
+        log_debug("MEM_PRESSURE: memory_pressure CLI not found — using fallback")
+        return _get_memory_pressure_fallback()
     except Exception as e:
         log_debug(f"MEM_PRESSURE: EXCEPTION — {type(e).__name__}: {e}")
+        return _get_memory_pressure_fallback()
+
+
+def _get_memory_pressure_fallback():
+    """Fallback: use psutil to estimate memory pressure."""
+    if psutil is None:
+        return "—", "#888888"
+    try:
+        mem = psutil.virtual_memory()
+        pct = mem.percent
+        log_debug(f"MEM_PRESSURE fallback: RAM={pct}%")
+
+        # macOS doesn't expose a per-process pressure API on ARM, use RAM % as proxy
+        if pct < 60:
+            return "Low", "#34c759"       # Green — plenty of free RAM
+        elif pct < 80:
+            return "Medium", "#ff9f0a"    # Yellow — getting warm
+        else:
+            return "High", "#ff3b30"      # Red — memory pressure!
+    except Exception as e:
+        log_debug(f"MEM_PRESSURE fallback EXCEPTION: {e}")
         return "—", "#888888"
 
 
