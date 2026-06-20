@@ -365,29 +365,32 @@ def _get_cached_lm_stats():
 def _get_memory_pressure():
     """Query macOS memory pressure via `memory_pressure` CLI (Apple Silicon & Intel)."""
     try:
-        # `memory_pressure` CLI exists on macOS Monterey+ and works on both Apple Silicon and Intel
+        # The raw `memory_pressure` CLI (no args) outputs human-readable lines like:
+        # "System-wide Memory Pressure: Low" or "Medium" or "High"
         result = subprocess.run(
-            ["memory_pressure", "json"],
+            ["memory_pressure"],
             capture_output=True, text=True, timeout=5
         )
 
         if result.returncode != 0:
-            log_debug(f"MEM_PRESSURE: memory_pressure exit={result.returncode}")
+            log_debug(f"MEM_PRESSURE: memory_pressure exit={result.returncode}, stderr={repr(result.stderr.strip()[:200])}")
             return _get_memory_pressure_fallback()
 
-        import json as _json_mod
-        data = _json_mod.loads(result.stdout.strip())
+        raw = result.stdout.strip().lower()
+        log_debug(f"MEM_PRESSURE: raw_output={repr(raw)}")
 
-        # The CLI outputs systemwide_pressure_level: "Low"/"Medium"/"High" or numeric codes
-        level_raw = data.get("systemwide_pressure_level", None)
-        log_debug(f"MEM_PRESSURE: raw={repr(level_raw)}, full_output_keys={list(data.keys())[:10]}")
-
-        if level_raw == 0 or str(level_raw).lower() == "low":
+        if "low" in raw:
             return "Low", "#34c759"       # Green
-        elif level_raw == 1 or str(level_raw).lower() == "medium":
+        elif "medium" in raw:
             return "Medium", "#ff9f0a"    # Yellow
+        elif "high" in raw:
+            log_debug("MEM_PRESSURE: system reports High — using psutil for context")
+            # Even if CLI says High, show RAM % as context so user knows how severe
+            mem_pct = _get_ram_percent()
+            return f"High ({mem_pct}% RAM)", "#ff3b30"
         else:
-            return "High", "#ff3b30"      # Red
+            log_debug(f"MEM_PRESSURE: unrecognized output '{raw}' — using fallback")
+            return _get_memory_pressure_fallback()
 
     except FileNotFoundError:
         log_debug("MEM_PRESSURE: memory_pressure CLI not found — using fallback")
@@ -397,22 +400,41 @@ def _get_memory_pressure():
         return _get_memory_pressure_fallback()
 
 
+def _get_ram_percent():
+    """Return RAM usage % if psutil is available, else '—'."""
+    if psutil is None:
+        return "—"
+    try:
+        return f"{psutil.virtual_memory().percent:.0f}%"
+    except Exception:
+        return "—"
+
+
 def _get_memory_pressure_fallback():
-    """Fallback: use psutil to estimate memory pressure."""
+    """Fallback: use RAM + swap to estimate pressure when CLI unavailable."""
     if psutil is None:
         return "—", "#888888"
     try:
         mem = psutil.virtual_memory()
         pct = mem.percent
-        log_debug(f"MEM_PRESSURE fallback: RAM={pct}%")
 
-        # macOS doesn't expose a per-process pressure API on ARM, use RAM % as proxy
-        if pct < 60:
-            return "Low", "#34c759"       # Green — plenty of free RAM
-        elif pct < 80:
-            return "Medium", "#ff9f0a"    # Yellow — getting warm
+        # On macOS, raw RAM % can be misleading because the OS uses free memory aggressively for caches.
+        # True pressure occurs when swap starts getting used. Check available + cached to distinguish.
+        avail_mb = mem.available / (1024 * 1024)
+        total_gb = mem.total / (1024**3)
+
+        log_debug(f"MEM_PRESSURE fallback: RAM={pct}%, avail={avail_mb:.0f}MB, total={total_gb:.1f}GB")
+
+        # Thresholds tuned for macOS behavior:
+        # - macOS keeps ~15-20% of RAM as "free" for caches at all times on modern systems
+        # - When available drops below ~8GB on a 36GB+ machine → Medium pressure starts
+        # - Below ~4GB available → High pressure
+        if avail_mb > 8000:  # > 8 GB still available (even if percent is high due to caches)
+            return "Low", "#34c759"       # Green — plenty of headroom
+        elif avail_mb > 2000:  # > 2 GB available
+            return "Medium", "#ff9f0a"    # Yellow — getting tight but manageable
         else:
-            return "High", "#ff3b30"      # Red — memory pressure!
+            return "High", "#ff3b30"      # Red — less than 2GB available, pressure imminent
     except Exception as e:
         log_debug(f"MEM_PRESSURE fallback EXCEPTION: {e}")
         return "—", "#888888"
