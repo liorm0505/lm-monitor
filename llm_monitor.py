@@ -365,17 +365,35 @@ def _get_cached_lm_stats():
 def _get_memory_pressure():
     """Query macOS memory pressure via sysctl."""
     try:
-        status = subprocess.run(
+        result = subprocess.run(
             ["sysctl", "-n", "vm.page_pressure"],
             capture_output=True, text=True
-        ).stdout.strip()
+        )
+        raw_stdout = repr(result.stdout)
+        stderr_val = result.stderr.strip() if result.stderr else "(empty)"
+        log_debug(f"MEM_PRESSURE: sysctl exit_code={result.returncode}, stdout={raw_stdout}, stderr={stderr_val}")
+
+        status = result.stdout.strip()
+        if not status:
+            log_debug("MEM_PRESSURE: ⚠️ empty string — defaulting to '—'")
+            return "—", "#888888"
+
+        # Try parsing as integer for Apple Silicon (which may return 0/1/2+)
+        try:
+            val = int(status)
+            log_debug(f"MEM_PRESSURE: parsed int={val}")
+        except ValueError:
+            log_debug(f"MEM_PRESSURE: ⚠️ not an integer, value='{status}'")
+
         if status == "0":
             return "Low", "#34c759"       # Green
         elif status == "1":
             return "Medium", "#ff9f0a"    # Yellow
         else:
+            log_debug(f"MEM_PRESSURE: falling through to High (value='{status}')")
             return "High", "#ff3b30"      # Red
-    except Exception:
+    except Exception as e:
+        log_debug(f"MEM_PRESSURE: EXCEPTION — {type(e).__name__}: {e}")
         return "—", "#888888"
 
 
