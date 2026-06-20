@@ -396,6 +396,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
     commit_hash, commit_ts = _get_git_info()
     uptime = _uptime_str()
     logs_enabled = _cache.get("logs_enabled", False)
+    print(f"🐛 DEBUG RENDER: logs_enabled={logs_enabled} (raw cache={_cache.get('logs_enabled', 'MISSING')!r})")
     dbg_color = "#ff453a" if logs_enabled else "#8e8e93"  # Red when on, gray when off
 
     # Format commit time as relative ("2 min ago", "3 days ago", etc.)
@@ -566,8 +567,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # Parse query string: /debug/toggle?enable=1 or /debug/toggle?enable=0
             params = self.path.split("?")[1] if "?" in self.path else ""
             enable = "1" in params or "true" in params.lower()
+            old_val = _cache.get("logs_enabled", False)
             _cache["logs_enabled"] = enable
             _toggle_logs(enable)
+            print(f"🐛 DEBUG TOGGLE: {old_val} → {enable} (params={params!r})")
             response_text = "Debug logging enabled" if enable else "Debug logging disabled"
             self.send_response(200)
             self.send_header("Content-type", "text/plain")
