@@ -508,7 +508,19 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
         .then(() => {{ location.reload(); }})
         .catch(() => {{}});
     }}
+
+    // Reset aggregation window
+    function resetAvg() {{
+      if (!confirm('Reset the running average of last {AVG_WINDOW} requests? This will clear cached stats and re-scan from disk.')) return;
+      fetch('/reset_avg')
+        .then(() => {{ location.reload(); }})
+        .catch(() => {{ alert('Failed to reset'); }});
+    }}
   </script>
+
+  <div style="text-align:center; margin-top:12px;">
+    <button onclick="resetAvg()" style="background:#3a3a3c;color:#fff;border:none;padding:8px 16px;border-radius:8px;font-size:0.9em;cursor:pointer;">Reset Aggregation ({AVG_WINDOW})</button>
+  </div>
 
   <button class="refresh-btn" onclick="location.reload()">↻</button>
 </body>
@@ -563,6 +575,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(status_data, indent=2).encode())
+
+        elif self.path == "/reset_avg":
+            # Reset aggregation window: clear recent requests and force cache refetch
+            _cache["recent_requests"] = []
+            _cache["lm_ts"] = 0
+            print("🔄 Aggregation reset — cleared recent_requests, forcing fresh log scan on next request")
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "reset"}).encode())
 
         elif self.path.startswith("/debug/toggle"):
             # Parse query string: /debug/toggle?enable=1 or /debug/toggle?enable=0
