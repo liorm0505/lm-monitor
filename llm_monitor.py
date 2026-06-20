@@ -24,6 +24,7 @@ import time
 import os
 import sys
 from datetime import datetime
+import traceback
 from io import StringIO
 
 # Guarded psutil import — available in module scope for all functions
@@ -649,11 +650,16 @@ def handle_crash(exc_type, exc_value, exc_traceback) -> None:
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-    os.makedirs(LOGS_DIR, exist_ok=True)
-    with open(os.path.join(LOGS_DIR, "crash.log"), "a") as f:
-        f.write(f"--- Crashed at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-        f.write("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
-        f.write("\n")
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        with open(os.path.join(LOGS_DIR, "crash.log"), "a") as f:
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            f.write(f"--- Crashed at {ts} ---\n")
+            tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+            f.writelines(tb_lines)
+            f.write("\n")
+    except Exception:
+        pass  # If we can't write, still try below
     sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
 sys.excepthook = handle_crash
