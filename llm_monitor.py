@@ -213,6 +213,7 @@ def _read_lm_studio_logs():
         r'eval\s+time\s+=\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tokens.*?(\d+\.\d+)\s+tokens?\s+per\s+second'
     )
     task_re = re.compile(r'task\s+(\d+)')
+    ntokens_re = re.compile(r'n_tokens\s*=\s*(\d+)')  # Context size from slot print_timing
     
     # Process each log file (newest first)
     total_lines = 0
@@ -236,17 +237,24 @@ def _read_lm_studio_logs():
                     continue
                 task_id = task_match.group(1)
                 
-                # Check for prompt eval time
+                # Extract n_tokens from slot print_timing (this is the actual context size LM Studio shows)
+                ntokens_match = ntokens_re.search(line)
+                if ntokens_match:
+                    n_tokens_val = int(ntokens_match.group(1))
+                    if task_id not in task_metrics:
+                        task_metrics[task_id] = {}
+                    # Use n_tokens as the authoritative context size (matches LM Studio UI)
+                    task_metrics[task_id]['prompt_tokens'] = n_tokens_val
+                
+                # Check for prompt eval time (for speed calculation, not used for context size anymore)
                 prompt_match = prompt_re.search(line)
                 if prompt_match:
                     prompt_time_ms = float(prompt_match.group(1))
-                    prompt_tokens = int(prompt_match.group(2))
                     prompt_tps = float(prompt_match.group(3))
                     
                     if task_id not in task_metrics:
                         task_metrics[task_id] = {}
                     task_metrics[task_id]['prompt_time_ms'] = prompt_time_ms
-                    task_metrics[task_id]['prompt_tokens'] = prompt_tokens
                     task_metrics[task_id]['prompt_tps'] = prompt_tps
                 
                 # Check for eval time (generation)
@@ -355,7 +363,11 @@ def _get_cached_lm_stats():
         })
 
         print(f"📊 Stats updated: {count} requests in window, gen_speed={gen_speed}, prompt_speed={prompt_tps}, context={avg_context:.0f} tokens")
-    return _cache["lm_online"], _cache["lm_gen_speed"], _cache["lm_detail"], _cache["lm_ttft"], _cache["lm_prompt_tps"], _cache["lm_context_size"]
+    # Gracefully handle case where all lm_* keys were cleared (e.g., after /reset_avg)
+    if "lm_online" not in _cache:
+        return False, "—", "No data yet — waiting for completions", "—", "—", None
+    
+    return _cache["lm_online"], _cache["lm_gen_speed"], _cache["lm_detail"], _cache["lm_ttft"], _cache["lm_prompt_tps"], _cache.get("lm_context_size")
 
 
 # ──────────────────────────────────────────────
@@ -365,8 +377,6 @@ def _get_cached_lm_stats():
 def _get_memory_pressure():
     """Query macOS memory pressure via `memory_pressure` CLI (Apple Silicon & Intel)."""
     try:
-        # The raw `memory_pressure` CLI (no args) outputs human-readable lines like:
-        # "System-wide Memory Pressure: Low" or "Medium" or "High"
         result = subprocess.run(
             ["memory_pressure"],
             capture_output=True, text=True, timeout=5
@@ -376,67 +386,81 @@ def _get_memory_pressure():
             log_debug(f"MEM_PRESSURE: memory_pressure exit={result.returncode}, stderr={repr(result.stderr.strip()[:200])}")
             return _get_memory_pressure_fallback()
 
-        raw = result.stdout.strip().lower()
-        log_debug(f"MEM_PRESSURE: raw_output={repr(raw)}")
+        raw = result.stdout.strip()
+        log_debug(f"MEM_PRESSURE: raw_stdout={repr(raw)}")
 
-        if "low" in raw:
-            return "Low", "#34c759"       # Green
-        elif "medium" in raw:
-            return "Medium", "#ff9f0a"    # Yellow
-        elif "high" in raw:
-            log_debug("MEM_PRESSURE: system reports High — using psutil for context")
-            # Even if CLI says High, show RAM % as context so user knows how severe
-            mem_pct = _get_ram_percent()
-            return f"High ({mem_pct}% RAM)", "#ff3b30"
+        # macOS memory_pressure CLI can output JSON {"systemwide_pressure_level": 0} or plain text "System-wide Memory Pressure: Low"
+        level = None
+
+        # 1. Try parsing as JSON first (common on Ventura/Sonoma)
+        try:
+            import json as _json_mod
+            data = _json_mod.loads(raw)
+            if isinstance(data, dict):
+                level = data.get("systemwide_pressure_level") or data.get("pressure_level")
+        except (ValueError, TypeError):
+            pass
+
+        # 2. Fallback: grep for text keywords
+        if level is None:
+            lower_raw = raw.lower()
+            if "low" in lower_raw:
+                level = 0
+            elif "medium" in lower_raw:
+                level = 1
+            elif "high" in lower_raw:
+                level = 2
+
+        # 3. Fallback: parse numeric (some CLI versions just print 0, 1, or 2)
+        if level is None:
+            try:
+                level = int(raw.strip())
+            except ValueError:
+                pass
+
+        if level == 0:
+            return "Low", "#34c759"       # Green — Activity Monitor green bar
+        elif level == 1:
+            return "Medium", "#ff9f0a"    # Yellow — Activity Monitor yellow bar
         else:
-            log_debug(f"MEM_PRESSURE: unrecognized output '{raw}' — using fallback")
-            return _get_memory_pressure_fallback()
+            return "High", "#ff3b30"      # Red — Activity Monitor red bar
 
     except FileNotFoundError:
-        log_debug("MEM_PRESSURE: memory_pressure CLI not found — using fallback")
-        return _get_memory_pressure_fallback()
+        log_debug("MEM_PRESSURE: memory_pressure CLI not found — using psutil estimate")
+        return _get_memory_pressure_psutil()
     except Exception as e:
         log_debug(f"MEM_PRESSURE: EXCEPTION — {type(e).__name__}: {e}")
-        return _get_memory_pressure_fallback()
+        return _get_memory_pressure_psutil()
 
 
-def _get_ram_percent():
-    """Return RAM usage % if psutil is available, else '—'."""
-    if psutil is None:
-        return "—"
-    try:
-        return f"{psutil.virtual_memory().percent:.0f}%"
-    except Exception:
-        return "—"
-
-
-def _get_memory_pressure_fallback():
-    """Fallback: use RAM + swap to estimate pressure when CLI unavailable."""
+def _get_memory_pressure_psutil():
+    """Fallback when CLI unavailable: estimate pressure from psutil RAM metrics.
+    
+    On macOS Monterey+, the `memory_pressure` CLI should always be present, so this
+    fallback mainly catches edge cases (CLI crashes, non-macOS hosts). We use available
+    RAM rather than used % because macOS aggressively caches free memory — a 90% "used"
+    reading often means only ~3GB is actually held by processes.
+    
+    Thresholds tuned for ~24GB Mac:
+      >6 GB available → Low (green)
+      >2 GB available → Medium (yellow)  
+      <2 GB available → High (red)
+    """
     if psutil is None:
         return "—", "#888888"
     try:
         mem = psutil.virtual_memory()
-        pct = mem.percent
-
-        # On macOS, raw RAM % can be misleading because the OS uses free memory aggressively for caches.
-        # True pressure occurs when swap starts getting used. Check available + cached to distinguish.
         avail_mb = mem.available / (1024 * 1024)
-        total_gb = mem.total / (1024**3)
+        log_debug(f"MEM_PRESSURE psutil fallback: RAM={mem.percent:.0f}%, available={avail_mb:.0f}MB")
 
-        log_debug(f"MEM_PRESSURE fallback: RAM={pct}%, avail={avail_mb:.0f}MB, total={total_gb:.1f}GB")
-
-        # Thresholds tuned for macOS behavior:
-        # - macOS keeps ~15-20% of RAM as "free" for caches at all times on modern systems
-        # - When available drops below ~8GB on a 36GB+ machine → Medium pressure starts
-        # - Below ~4GB available → High pressure
-        if avail_mb > 8000:  # > 8 GB still available (even if percent is high due to caches)
-            return "Low", "#34c759"       # Green — plenty of headroom
-        elif avail_mb > 2000:  # > 2 GB available
-            return "Medium", "#ff9f0a"    # Yellow — getting tight but manageable
-        else:
-            return "High", "#ff3b30"      # Red — less than 2GB available, pressure imminent
+        if avail_mb > 6000:   # > 6 GB still free → Low pressure
+            return "Low", "#34c759"
+        elif avail_mb > 2000:  # 2–6 GB free → Medium pressure
+            return "Medium", "#ff9f0a"
+        else:                  # < 2 GB free → High pressure
+            return "High", "#ff3b30"
     except Exception as e:
-        log_debug(f"MEM_PRESSURE fallback EXCEPTION: {e}")
+        log_debug(f"MEM_PRESSURE psutil fallback EXCEPTION: {e}")
         return "—", "#888888"
 
 
@@ -455,6 +479,12 @@ def _get_ram_usage():
 def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context):
     timestamp = datetime.now().strftime("%H:%M:%S")
     dot_color = "#34c759" if lm_online else "#ff3b30"
+    
+    # Handle empty context (after reset or no data)
+    if not lm_context:
+        context_display = "Reset — waiting for completions..."
+    else:
+        context_display = f"{lm_context:.0f} tokens"
     commit_hash, commit_ts = _get_git_info()
     uptime = _uptime_str()
     logs_enabled = _cache.get("logs_enabled", False)
@@ -540,7 +570,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
 
   <div class="card">
     <h2><span class="status-dot"></span>Avg Context Size</h2>
-    <div class="value">{lm_context:.0f} tokens</div>
+    <div class="value">{context_display}</div>
     <div class="sub">Average prompt token count over last {AVG_WINDOW} requests</div>
   </div>
 
@@ -639,10 +669,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(status_data, indent=2).encode())
 
         elif self.path == "/reset_avg":
-            # Reset aggregation window: clear recent requests and force cache refetch
+            # Reset aggregation window: clear recent requests AND freeze cache scan
             _cache["recent_requests"] = []
-            _cache["lm_ts"] = 0
-            print("🔄 Aggregation reset — cleared recent_requests, forcing fresh log scan on next request")
+            _cache["lm_ts"] = time.time()  # Freeze — won't re-scan for CACHE_TTL seconds, so old data doesn't immediately repopulate
+            # Clear all LM stats from cache so dashboard shows empty during freeze period
+            for key in list(_cache.keys()):
+                if key.startswith("lm_"):
+                    del _cache[key]
+            print("🔄 Aggregation reset — cleared recent_requests and LM stats; dashboard will show empty until new completions arrive")
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
