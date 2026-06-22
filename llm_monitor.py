@@ -310,7 +310,7 @@ def _calculate_averages(requests):
     Returns (avg_gen_speed, avg_prompt_time_ms, detail_string, sample_count)
     """
     if not requests:
-        return "—", "—", "No completion requests found in logs", 0
+        return "—", "—", "—", "—", "No completion requests found in logs", 0
     
     # Use gen_speed_tps directly from logs (already calculated per-request)
     speeds = [r["gen_speed_tps"] for r in requests if r["gen_speed_tps"] > 0]
@@ -362,7 +362,7 @@ def _get_cached_lm_stats():
             "lm_ts": now,
         })
 
-        print(f"📊 Stats updated: {count} requests in window, gen_speed={gen_speed}, prompt_speed={prompt_tps}, context={avg_context:.0f} tokens")
+        print(f"📊 Stats updated: {count} requests in window, gen_speed={gen_speed}, prompt_speed={prompt_tps}, context={avg_context}")
     # Gracefully handle case where all lm_* keys were cleared (e.g., after /reset_avg)
     if "lm_online" not in _cache:
         return False, "—", "No data yet — waiting for completions", "—", "—", None
@@ -480,8 +480,8 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
     timestamp = datetime.now().strftime("%H:%M:%S")
     dot_color = "#34c759" if lm_online else "#ff3b30"
     
-    # Handle empty context (after reset or no data)
-    if not lm_context:
+    # Handle empty/no data context (after reset, no logs yet, or placeholder "—")
+    if not lm_context or lm_context == "—" or isinstance(lm_context, str):
         context_display = "Reset — waiting for completions..."
     else:
         context_display = f"{lm_context:.0f} tokens"
