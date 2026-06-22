@@ -176,13 +176,17 @@ _cache = {
 # Data collection — parse LM Studio text-based logs
 # ──────────────────────────────────────────────
 
-def _read_lm_studio_logs():
+def _read_lm_studio_logs(since_ts=None):
     """Read and parse LM Studio's server logs (text format).
     
     Extracts metrics from 'slot print_timing' lines:
     - prompt eval time = XXXX ms / YYYY tokens (ZZZ.ZZ t/s)
     - eval time = XXXX ms / YY tokens (BB.BB t/s)
     - total time = XXXX ms / ZZZZ tokens
+    
+    Args:
+        since_ts: If set, only include entries with timestamps >= this value.
+                  Used after /reset_avg to filter out old historical data.
     
     Returns list of dicts with: task_id, prompt_tokens, completion_tokens, 
                                  prompt_time_ms, eval_time_ms, gen_speed_tps
@@ -191,6 +195,18 @@ def _read_lm_studio_logs():
     
     results = []
     
+    # Timestamp regex for filtering entries after /reset_avg
+    ts_re = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+    
+    def parse_line_ts(line):
+        """Extract datetime from log line timestamp, or None."""
+        m = ts_re.search(line)
+        if not m: return None
+        try:
+            return datetime.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return None
+
     # Early exit if no log files found
     if _cache["log_file_exists"] is False:
         print("📋 No LM Studio log files found — skipping scan. "
@@ -228,6 +244,13 @@ def _read_lm_studio_logs():
             
             for line in lines[-1000:]:  # Last 1000 lines per file
                 line = line.strip()
+                
+                # Filter: skip entries older than reset time (if active)
+                if since_ts is not None:
+                    line_ts = parse_line_ts(line)
+                    if line_ts and line_ts < since_ts:
+                        continue
+                
                 if not line or 'slot print_timing' not in line:
                     continue
                 
@@ -336,6 +359,20 @@ def _calculate_averages(requests):
 
 def _get_cached_lm_stats():
     """Return cached LM Studio stats unless TTL has expired."""
+    # During fresh-start (after /reset_avg), skip log scanning until real completions arrive
+    if "fresh_start_ts" in _cache:
+        reset_time = _cache["fresh_start_ts"]
+        now = time.time()
+        # Scan logs but filter to only entries AFTER the reset timestamp
+        requests = _read_lm_studio_logs(since_ts=datetime.utcfromtimestamp(reset_time) if isinstance(reset_time, (int, float)) else datetime.now())
+        
+        # If we found fresh data after reset point, clear the flag and proceed normally
+        if requests:
+            del _cache["fresh_start_ts"]
+            print("✅ Fresh completions detected post-reset — resuming normal metrics")
+        else:
+            return False, "—", "No data yet — waiting for completions...", "—", "—", None
+    
     now = time.time()
     if now - _cache["lm_ts"] > CACHE_TTL:
         # Read and parse log file
@@ -687,13 +724,13 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
             self.wfile.write(json.dumps(status_data, indent=2).encode())
 
         elif self.path == "/reset_avg":
-            # Reset aggregation window: clear recent requests and all LM stats, keep lm_ts to avoid KeyError
+            # Reset aggregation window: clear all metrics and mark fresh-start so we skip disk scan
             _cache["recent_requests"] = []
             for key in list(_cache.keys()):
-                if key.startswith("lm_") and key != "lm_ts":
+                if key.startswith("lm_"):
                     del _cache[key]
-            _cache["lm_ts"] = time.time()  # Freeze scan — dashboard shows "No data yet" until fresh completions arrive after CACHE_TTL
-            print("🔄 Aggregation reset — cleared recent_requests and LM stats; dashboard will show empty until new completions arrive")
+            _cache["fresh_start_ts"] = time.time()  # Persistent flag — prevents log re-scan until new completions arrive
+            print("🔄 Aggregation reset — cleared all metrics; dashboard will show empty until new completions arrive")
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
