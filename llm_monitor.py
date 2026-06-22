@@ -633,18 +633,36 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             os.execv(sys.executable, [sys.executable, __file__])
 
         if self.path == "/":
-            pressure, p_color = _get_memory_pressure()
-            ram_pct, ram_total, ram_avail = _get_ram_usage()
-            lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context = _get_cached_lm_stats()
+            try:
+                pressure, p_color = _get_memory_pressure()
+                ram_pct, ram_total, ram_avail = _get_ram_usage()
+                lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context = _get_cached_lm_stats()
 
-            html = generate_html(
-                pressure, p_color, ram_pct, ram_total, ram_avail,
-                lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context
-            )
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            self.wfile.write(html.encode())
+                html = generate_html(
+                    pressure, p_color, ram_pct, ram_total, ram_avail,
+                    lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context
+                )
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(html.encode())
+            except Exception as e:
+                print(f"❌ ERROR serving /: {type(e).__name__}: {e}")
+                import traceback; traceback.print_exc()
+                try:
+                    err_html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Error</title>
+<style>*{{box-sizing:border-box;margin:0;padding:24px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#1a1a1a;color:#fff}}
+body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-bottom:16px}}pre{{background:#2d2d2d;padding:12px;border-radius:8px;overflow-x:auto;font-size:0.8em;white-space:pre-wrap}}
+.sub{{color:#aaa;margin-top:16px}}</style></head><body>
+<h1>⚠️ Dashboard Error</h1><pre>{traceback.format_exc()}</pre>
+<div class="sub">Check ~/llm-monitor/logs/crash.log for details. Server process is alive (status endpoint works).</div>
+</body></html>"""
+                    self.send_response(500)
+                    self.send_header("Content-type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(err_html.encode())
+                except Exception:
+                    pass  # Connection may already be closed
 
         elif self.path == "/status":
             uptime = int(time.time() - _START_TIME)
