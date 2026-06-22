@@ -687,13 +687,12 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
             self.wfile.write(json.dumps(status_data, indent=2).encode())
 
         elif self.path == "/reset_avg":
-            # Reset aggregation window: clear recent requests AND freeze cache scan
+            # Reset aggregation window: clear recent requests and all LM stats, keep lm_ts to avoid KeyError
             _cache["recent_requests"] = []
-            _cache["lm_ts"] = time.time()  # Freeze — won't re-scan for CACHE_TTL seconds, so old data doesn't immediately repopulate
-            # Clear all LM stats from cache so dashboard shows empty during freeze period
             for key in list(_cache.keys()):
-                if key.startswith("lm_"):
+                if key.startswith("lm_") and key != "lm_ts":
                     del _cache[key]
+            _cache["lm_ts"] = time.time()  # Freeze scan — dashboard shows "No data yet" until fresh completions arrive after CACHE_TTL
             print("🔄 Aggregation reset — cleared recent_requests and LM stats; dashboard will show empty until new completions arrive")
             self.send_response(200)
             self.send_header("Content-type", "application/json")
