@@ -6,12 +6,11 @@ LM Monitor — Real-time LLM Inference Dashboard for Mac Mini (Apple Silicon)
 Monitors:
   • macOS Memory Pressure (Low / Medium / High)
   • Unified RAM Usage (GB used / available / total)
-  • GPU Utilization & Temperature (macOS Apple Silicon + Linux NVIDIA/AMD fallback)
-  • LM Studio Avg Generation Speed (tokens/sec via API probe)
-  • LM Studio Avg Prompt Processing Time (via API probe)
+  • LM Studio Avg Generation Speed (tokens/sec from server.log parsing)
+  • LM Studio Avg Prompt Processing Time (from server.log parsing)
 
-Uses lightweight HTTP probes to LM Studio's /v1/chat/completions endpoint 
-with max_tokens=1 — zero log parsing, no verbose logging required.
+Parses LM Studio's verbose server.log files for real metrics — no inference probing needed.
+Enable 'Verbose Server Logs' in LM Studio → Settings → Developer.
 
 Requirements: Python 3.9+ with psutil and requests packages.
 Author: Hermes Agent · Nous Research
@@ -30,12 +29,6 @@ import traceback
 from io import StringIO
 import urllib.request  # stdlib — always available on Python 3.9+
 import urllib.error    # stdlib — always available on Python 3.9+
-
-try:
-    from scapy.all import sniff, TCP, IP, Raw, wrpcap
-    SCAPY_AVAILABLE = True
-except ImportError:
-    SCAPY_AVAILABLE = False
 
 # Guarded psutil import — available in module scope for all functions
 try:
@@ -133,185 +126,21 @@ CACHE_TTL       = 5                         # Seconds between API probes
 AVG_WINDOW      = 10                        # Running average over last N probe results
 BACKUP_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
 MAX_BACKUPS     = 5                         # Keep last N backups
-CAPTURE_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-CAPTURE_STATS   = os.path.join(CAPTURE_DIR, "capture_stats.json")
-CAPTURE_LM_PORT = 1234                    # LM Studio API port
-
-# Network capture state
-capture_active = False
-capture_thread = None
-capture_stats = []
-capture_lock = threading.Lock()
 
 # ──────────────────────────────────────────────
-# Network packet capture — lightweight scapy-based
+# LM Studio log path — macOS v0.4+ directory structure
+# Logs are organized by month: ~/.lmstudio/server-logs/YYYY-MM/
 # ──────────────────────────────────────────────
+LM_STUDIO_LOG_DIR = os.path.expanduser("~/.lmstudio/server-logs")
 
-def _parse_http_response(raw_bytes):
-    """Parse HTTP response to extract JSON body and timing info."""
-    try:
-        text = raw_bytes.decode('utf-8', errors='ignore')
-        # Find JSON body (after \r\n\r\n)
-        if '\\r\\n\\r\\n' in text:
-            json_start = text.index('\\r\\n\\r\\n') + 4
-            json_body = text[json_start:]
-            return json.loads(json_body)
-        elif '{' in text:
-            return json.loads(text[text.index('{'):])
-    except (json.JSONDecodeError, ValueError, IndexError):
-        pass
-    return None
-
-
-def _packet_callback(pkt):
-    """Callback for scapy packet capture."""
-    global capture_stats
-    
-    if not pkt.haslayer(TCP) or not pkt.haslayer(IP):  # type: ignore
-        return
-    
-    # Filter for LM Studio port (1234)
-    dst_port = pkt[TCP].dport  # type: ignore
-    src_port = pkt[TCP].sport  # type: ignore
-    
-    if dst_port != CAPTURE_LM_PORT and src_port != CAPTURE_LM_PORT:
-        return
-    
-    # Only capture TCP payload (HTTP data)
-    if not pkt.haslayer(Raw):  # type: ignore
-        return
-    
-    payload = bytes(pkt[Raw].load)  # type: ignore
-    
-    # Detect response packets (port 1234 is the destination for requests, so responses come FROM 1234)
-    if dst_port == CAPTURE_LM_PORT:
-        # This is a request - we'll capture timing from the response
-        return
-    
-    # This is a response from LM Studio
-    with capture_lock:
-        now = time.time()
-        json_data = _parse_http_response(payload)
-        
-        stat = {
-            'timestamp': now,
-            'dst_port': dst_port,
-            'src_port': src_port,
-            'size': len(payload),
-            'json_data': json_data
-        }
-        
-        # Extract token usage if available
-        if json_data and isinstance(json_data, dict):
-            usage = json_data.get('usage', {})
-            if usage:
-                stat['input_tokens'] = usage.get('prompt_tokens', 0)
-                stat['output_tokens'] = usage.get('completion_tokens', 0)
-                stat['total_tokens'] = usage.get('total_tokens', 0)
-        
-        capture_stats.append(stat)
-        
-        # Keep only last 1000 stats to prevent memory issues
-        if len(capture_stats) > 1000:
-            capture_stats = capture_stats[-500:]
-
-
-def _start_capture():
-    """Start network packet capture in background thread."""
-    global capture_active, capture_thread, capture_stats
-    
-    if capture_active:
-        return
-    
-    if not SCAPY_AVAILABLE:
-        log_debug("scapy not available — packet capture disabled")
-        return
-    
-    with capture_lock:
-        capture_stats = []
-        capture_active = True
-    
-    # Start capture thread
-    def capture_worker():
-        try:
-            log_debug("📡 Starting packet capture on port " + str(CAPTURE_LM_PORT))
-            sniff(
-                filter=f"tcp port {CAPTURE_LM_PORT}",
-                prn=_packet_callback,
-                store=False,
-                stop_filter=lambda p: not capture_active
-            )
-        except Exception as e:
-            log_debug(f"Packet capture error: {type(e).__name__}: {e}")
-        finally:
-            with capture_lock:
-                capture_active = False
-    
-    capture_thread = threading.Thread(target=capture_worker, daemon=True)
-    capture_thread.start()
-
-
-def _stop_capture():
-    """Stop network packet capture."""
-    global capture_active
-    
-    with capture_lock:
-        capture_active = False
-    
-    log_debug("📡 Packet capture stopped")
-
-
-def _get_capture_stats():
-    """Return captured stats as JSON."""
-    with capture_lock:
-        if not capture_stats:
-            return {
-                'count': 0,
-                'avg_input_tokens': 0,
-                'avg_output_tokens': 0,
-                'total_requests': 0,
-                'errors': 0
-            }
-        
-        total_input = sum(s.get('input_tokens', 0) for s in capture_stats)
-        total_output = sum(s.get('output_tokens', 0) for s in capture_stats)
-        error_count = sum(1 for s in capture_stats if s.get('error'))
-        
-        return {
-            'count': len(capture_stats),
-            'avg_input_tokens': total_input / len(capture_stats) if capture_stats else 0,
-            'avg_output_tokens': total_output / len(capture_stats) if capture_stats else 0,
-            'total_requests': len(capture_stats),
-            'errors': error_count
-        }
-
-
-def _save_capture_stats():
-    """Save capture stats to JSON file."""
-    try:
-        os.makedirs(CAPTURE_DIR, exist_ok=True)
-        with open(CAPTURE_STATS, 'w') as f:
-            json.dump(capture_stats, f, indent=2, default=str)
-        log_debug(f"Capture stats saved to {CAPTURE_STATS}")
-    except Exception as e:
-        log_debug(f"Failed to save capture stats: {type(e).__name__}: {e}")
-
-
-# ──────────────────────────────────────────────
-# Backup management — timestamped script backups for rollback
-# ──────────────────────────────────────────────
 
 def _create_backup():
-    """Create a timestamped backup of the current script.
-    
-    Returns backup path or None on failure.
-    """
+    """Create a timestamped backup of the current script."""
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = os.path.join(BACKUP_DIR, f"llm_monitor_{timestamp}.py")
         
-        # Copy current script to backup
         with open(_SCRIPT_PATH, "r", encoding="utf-8") as src:
             content = src.read()
         with open(backup_path, "w", encoding="utf-8") as dst:
@@ -335,7 +164,6 @@ def _cleanup_old_backups():
             if f.startswith("llm_monitor_") and f.endswith(".py")
         ])
         
-        # Remove oldest if we have more than MAX_BACKUPS
         while len(backups) > MAX_BACKUPS:
             oldest = backups.pop(0)
             os.remove(os.path.join(BACKUP_DIR, oldest))
@@ -421,200 +249,253 @@ _SCRIPT_MTIME_START = os.path.getmtime(_SCRIPT_PATH)
 
 
 # ──────────────────────────────────────────────
-# LM Studio API probe — lightweight stats collection
+# LM Studio log path — macOS v0.4+ directory structure
+# Logs are organized by month: ~/.lmstudio/server-logs/YYYY-MM/
 # ──────────────────────────────────────────────
+LM_STUDIO_LOG_DIR = os.path.expanduser("~/.lmstudio/server-logs")
 
-def _probe_lm_studio():
-    """Send a single max_tokens=1 probe to /v1/chat/completions and extract timing stats.
+
+def _find_log_files():
+    """Find all log files in the current month's directory."""
+    import datetime
     
-    Returns dict with: gen_speed_tps (float), ttft_ms (float), or None on failure.
-    This is the ONLY data collection path now — no log parsing at all.
-    """
-    # urllib is always available on Python 3.9+ (stdlib)
-
-    probe_payload = {
-        "model": "",  # empty string tells LM Studio to use the currently loaded model
-        "messages": [{"role": "user", "content": "."}],
-        "max_tokens": 1,
-        "temperature": 0.1,
-    }
+    now = datetime.datetime.now()
+    month_dir = os.path.join(LM_STUDIO_LOG_DIR, now.strftime("%Y-%m"))
     
-    url = f"{LM_STUDIO_URL}/v1/chat/completions"
-    data = json.dumps(probe_payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        start_time = time.time()
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        elapsed_s = time.time() - start_time
-        
-        # Extract stats from response
-        stats = body.get("stats") or {}  # LM Studio native API
-        
-        gen_speed = None
-        ttft_ms = None
-        
-        # 1. Try LM Studio native stats format
-        if "tokens_per_second" in stats:
-            tps = stats["tokens_per_second"]
-            if tps > 0:
-                gen_speed = tps
-        
-        if "time_to_first_token_seconds" in stats:
-            ttft_s = stats["time_to_first_token_seconds"]
-            ttft_ms = ttft_s * 1000
-
-        # 2. Fallback: calculate from OpenAI-compatible response + timing
-        if gen_speed is None or ttft_ms is None:
-            usage = body.get("usage", {}) or {}
-            prompt_tokens = usage.get("prompt_tokens", 0) or 0
-            completion_tokens = usage.get("completion_tokens", 0) or 0
-            total_tokens = usage.get("total_tokens", 0) or 0
-            
-            # Calculate generation speed from elapsed time
-            if completion_tokens > 0 and elapsed_s > 0:
-                gen_speed = completion_tokens / elapsed_s
-            
-            # Estimate TTFT: time minus generation time for remaining tokens
-            if completion_tokens > 0 and elapsed_s > 0 and prompt_tokens > 0:
-                # Simple estimate: TTFT ≈ total_time - (total_tokens / gen_speed)
-                # But since we only have 1 completion token, TTFT ≈ elapsed time
-                ttft_ms = elapsed_s * 1000
-        
-        return {"gen_speed_tps": gen_speed, "ttft_ms": ttft_ms}
-
-    except urllib.error.URLError as e:
-        # LM Studio not running or unreachable
-        log_debug(f"PROBE FAILED: {e}")
-        return None
-    except Exception as e:
-        log_debug(f"PROBE ERROR: {type(e).__name__}: {e}")
-        return None
-
-
-def _probe_lm_studio_batch(n=3):
-    """Send n probes quickly and collect individual results.
+    if not os.path.isdir(month_dir):
+        return []
     
-    Returns list of probe result dicts (may contain None for failed probes).
-    """
-    results = []
-    for _ in range(n):
-        r = _probe_lm_studio()
-        results.append(r)
-        # Small delay between probes so stats are independent
-        time.sleep(0.15)
-    return results
+    files = [f for f in os.listdir(month_dir) if f.endswith('.log')]
+    files.sort(reverse=True)  # Newest first
+    return [os.path.join(month_dir, f) for f in files]
+
+
+def _log_file_exists():
+    """Check if any log files exist."""
+    return len(_find_log_files()) > 0
 
 
 # ──────────────────────────────────────────────
-# LM Studio model info — free metadata probe (no inference)
-# ──────────────────────────────────────────────
-
-def get_lm_studio_info():
-    """Fetch model metadata from LM Studio without triggering inference.
-    
-    Calls GET /v1/models which returns model name, context_length, etc.
-    Zero token cost — pure metadata.
-    
-    Returns dict with: name, context_length, object type, or error message.
-    """
-    try:
-        url = f"{LM_STUDIO_URL}/v1/models"
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        
-        models = data.get("data", [])
-        if models:
-            m = models[0]
-            ctx = m.get("context_length")
-            return {
-                "name": m.get("id", "Unknown"),
-                "context_length": ctx if ctx else "Unknown",
-                "object": m.get("object", "model"),
-                "online": True,
-            }
-        return {"error": "No models loaded in LM Studio", "online": True}
-    except urllib.error.URLError as e:
-        return {"error": f"LM Studio unreachable: {e}", "online": False}
-    except Exception as e:
-        return {"error": f"Failed to fetch model info: {type(e).__name__}: {e}", "online": False}
-
-
-# ──────────────────────────────────────────────
-# Cache state — prevents frequent API calls on page reloads
+# Cache state — prevents frequent file reads on page reloads
 # ──────────────────────────────────────────────
 _cache = {
     "lm_online": False,
-    "lm_gen_speed": "—",       # Avg generation speed (tokens/sec) from probe results
+    "lm_gen_speed": "—",       # Avg generation speed (tokens/sec) from real requests
     "lm_detail": "Waiting...", # Detail string with avg metrics
-    "lm_ttft": "—",            # Avg time to first token (ms) from probes
+    "lm_ttft": "—",            # Avg prompt processing time (ms)
     "lm_ts": 0,
     "logs_enabled": False,     # Toggle: capture stdout/stderr to /debug/logs
-    "recent_probes": [],       # Last N probe results (in memory)
+    "log_file_exists": None,   # Whether we found the log file on startup
+    "recent_requests": [],     # Last N parsed completion requests (in memory)
 }
 
 
 # ──────────────────────────────────────────────
-# Data collection — lightweight API probes
+# Data collection — parse LM Studio text-based logs
 # ──────────────────────────────────────────────
 
-def _get_cached_lm_stats():
-    """Return cached LM Studio stats unless TTL has expired.
+def _read_lm_studio_logs(since_ts=None):
+    """Read and parse LM Studio's server logs (text format).
     
-    On cache miss: sends 3 quick max_tokens=1 probes, averages results.
-    No file I/O, no log parsing — pure HTTP.
+    Extracts metrics from 'slot print_timing' lines:
+    - prompt eval time = XXXX ms / YYYY tokens (ZZZ.ZZ t/s)
+    - eval time = XXXX ms / YY tokens (BB.BB t/s)
+    - total time = XXXX ms / ZZZZ tokens
+    
+    Args:
+        since_ts: If set, only include entries with timestamps >= this value.
+    
+    Returns list of dicts with: task_id, prompt_tokens, completion_tokens, 
+                                 prompt_time_ms, eval_time_ms, gen_speed_tps
     """
+    import re
+    
+    results = []
+    
+    ts_re = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+    
+    def parse_line_ts(line):
+        """Extract datetime from log line timestamp, or None."""
+        m = ts_re.search(line)
+        if not m: return None
+        try:
+            return datetime.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return None
+
+    if _cache["log_file_exists"] is False:
+        print("📋 No LM Studio log files found — skipping scan. "
+              "Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
+        return results
+    
+    log_files = _find_log_files()
+    if not log_files:
+        print("📋 No log files in current month directory — skipping scan.")
+        return results
+    
+    print(f"📋 Found {len(log_files)} log file(s) to scan")
+    
+    prompt_re = re.compile(
+        r'prompt\s+eval\s+time\s+=\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tokens.*?(\d+\.\d+)\s+tokens?\s+per\s+second'
+    )
+    eval_re = re.compile(
+        r'eval\s+time\s+=\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tokens.*?(\d+\.\d+)\s+tokens?\s+per\s+second'
+    )
+    task_re = re.compile(r'task\s+(\d+)')
+    ntokens_re = re.compile(r'n_tokens\s*=\s*(\d+)')
+    
+    total_lines = 0
+    for log_file in log_files[:3]:  # Scan last 3 files max
+        try:
+            with open(log_file, "r", errors="replace") as f:
+                lines = f.readlines()
+            total_lines += len(lines)
+            
+            task_metrics = {}
+            
+            for line in lines[-1000:]:  # Last 1000 lines per file
+                line = line.strip()
+                
+                if since_ts is not None:
+                    line_ts = parse_line_ts(line)
+                    if line_ts and line_ts < since_ts:
+                        continue
+                
+                if not line or 'slot print_timing' not in line:
+                    continue
+                
+                task_match = task_re.search(line)
+                if not task_match:
+                    continue
+                task_id = task_match.group(1)
+                
+                ntokens_match = ntokens_re.search(line)
+                if ntokens_match:
+                    n_tokens_val = int(ntokens_match.group(1))
+                    if task_id not in task_metrics:
+                        task_metrics[task_id] = {}
+                    task_metrics[task_id]['prompt_tokens'] = n_tokens_val
+                
+                prompt_match = prompt_re.search(line)
+                if prompt_match:
+                    prompt_time_ms = float(prompt_match.group(1))
+                    prompt_tps = float(prompt_match.group(3))
+                    
+                    if task_id not in task_metrics:
+                        task_metrics[task_id] = {}
+                    task_metrics[task_id]['prompt_time_ms'] = prompt_time_ms
+                    task_metrics[task_id]['prompt_tps'] = prompt_tps
+                
+                eval_match = eval_re.search(line)
+                if eval_match:
+                    eval_time_ms = float(eval_match.group(1))
+                    completion_tokens = int(eval_match.group(2))
+                    eval_tps = float(eval_match.group(3))
+                    
+                    if task_id not in task_metrics:
+                        task_metrics[task_id] = {}
+                    task_metrics[task_id]['eval_time_ms'] = eval_time_ms
+                    task_metrics[task_id]['completion_tokens'] = completion_tokens
+                    task_metrics[task_id]['eval_tps'] = eval_tps
+            
+            for task_id, metrics in task_metrics.items():
+                if 'prompt_tokens' in metrics and 'completion_tokens' in metrics:
+                    prompt_tokens = metrics['prompt_tokens']
+                    completion_tokens = metrics['completion_tokens']
+                    prompt_time_ms = metrics.get('prompt_time_ms', 0)
+                    eval_time_ms = metrics.get('eval_time_ms', 0)
+                    
+                    if eval_time_ms > 0:
+                        gen_speed = completion_tokens / (eval_time_ms / 1000.0)
+                    else:
+                        gen_speed = 0
+                    
+                    results.append({
+                        'task_id': task_id,
+                        'prompt_tokens': prompt_tokens,
+                        'completion_tokens': completion_tokens,
+                        'prompt_time_ms': prompt_time_ms,
+                        'prompt_tps': metrics.get('prompt_tps', 0),
+                        'eval_time_ms': eval_time_ms,
+                        'gen_speed_tps': gen_speed,
+                    })
+
+                if task_id in task_metrics and 'prompt_tps' in task_metrics[task_id] and task_metrics[task_id]['prompt_tps'] > 0:
+                    print(f"🔍 Task {task_id}: prompt={prompt_tokens} tok ({metrics['prompt_tps']:.0f} t/s) · gen={completion_tokens} tok ({gen_speed:.1f} t/s)")
+                    
+        except Exception as e:
+            print(f"⚠️  Error reading {log_file}: {e}")
+    
+    print(f"📋 Parsed {len(results)} completion requests from {total_lines} lines")
+    return results
+
+
+def _calculate_averages(requests):
+    """Calculate running averages from parsed completion requests.
+    
+    Returns (avg_gen_speed, avg_prompt_time_ms, detail_string, sample_count)
+    """
+    if not requests:
+        return "—", "—", "—", "—", "No completion requests found in logs", 0
+    
+    speeds = [r["gen_speed_tps"] for r in requests if r["gen_speed_tps"] > 0]
+    prompt_times = [r["prompt_time_ms"] for r in requests if r["prompt_time_ms"] > 0]
+    prompt_tps_vals = [r["prompt_tps"] for r in requests if r["prompt_tps"] > 0]
+
+    avg_gen_speed = f"{sum(speeds) / len(speeds):.1f} tok/s" if speeds else "—"
+    avg_prompt_time = sum(prompt_times) / len(prompt_times) if prompt_times else 0
+    avg_prompt_tps = f"{sum(prompt_tps_vals) / len(prompt_tps_vals):.0f} tok/s" if prompt_tps_vals else "—"
+
+    avg_prompt = sum(r["prompt_tokens"] for r in requests) / len(requests)
+    avg_completion = sum(r["completion_tokens"] for r in requests) / len(requests)
+
+    detail_parts = [
+        f"{len(requests)} recent requests",
+        f"Context: {avg_prompt:.0f} tokens · Gen speed: {avg_gen_speed}",
+        f"Prompt processing: {avg_prompt_time:.0f} ms avg ({avg_prompt_tps})",
+    ]
+
+    return avg_gen_speed, avg_prompt_time, avg_prompt_tps, avg_prompt, ", ".join(detail_parts), len(requests)
+
+
+def _get_cached_lm_stats():
+    """Return cached LM Studio stats unless TTL has expired."""
+    # During fresh-start (after /reset_avg), skip log scanning until real completions arrive
+    if "fresh_start_ts" in _cache:
+        reset_time = _cache["fresh_start_ts"]
+        now = time.time()
+        requests = _read_lm_studio_logs(since_ts=datetime.utcfromtimestamp(reset_time) if isinstance(reset_time, (int, float)) else datetime.now())
+        
+        if requests:
+            del _cache["fresh_start_ts"]
+            print("✅ Fresh completions detected post-reset — resuming normal metrics")
+        else:
+            return False, "—", "No data yet — waiting for completions...", "—", "—", None
+    
     now = time.time()
     if now - _cache["lm_ts"] > CACHE_TTL:
-        # Send probe batch
-        print(f"📡 Probing LM Studio at {LM_STUDIO_URL}...")
+        # Read and parse log file
+        requests = _read_lm_studio_logs()
         
-        probes = _probe_lm_studio_batch(3)
-        success_count = sum(1 for p in probes if p is not None)
+        _cache["recent_requests"] = requests[-50:]
         
-        if success_count == 0:
-            # All probes failed — mark offline
-            print("⚠️  LM Studio unreachable at this time")
-            _cache.update({
-                "lm_online": False,
-                "lm_gen_speed": "—",
-                "lm_detail": f"LM Studio not reachable at {LM_STUDIO_URL}",
-                "lm_ttft": "—",
-                "lm_ts": now,
-            })
-        else:
-            # Aggregate successful probes
-            gen_speeds = [p["gen_speed_tps"] for p in probes if p is not None and p.get("gen_speed_tps")]
-            ttfts = [p["ttft_ms"] for p in probes if p is not None and p.get("ttft_ms") is not None]
-            
-            avg_gen = f"{sum(gen_speeds) / len(gen_speeds):.1f} tok/s" if gen_speeds else "—"
-            avg_ttft = f"{sum(ttfts) / len(ttfts):.0f} ms" if ttfts else "—"
-            
-            # Store individual probe results for running average display
-            _cache["recent_probes"] = probes[-AVG_WINDOW:]
-            
-            detail_parts = [
-                f"{success_count}/3 probes succeeded",
-                f"TTFT: {avg_ttft}",
-                f"Gen: {avg_gen}",
-            ]
-            
-            _cache.update({
-                "lm_online": True,
-                "lm_gen_speed": avg_gen if gen_speeds else "—",
-                "lm_detail": ", ".join(detail_parts),
-                "lm_ttft": avg_ttft if ttfts else "—",
-                "lm_ts": now,
-            })
-            
-            print(f"📊 Probe results: {success_count}/3 succeeded")
+        window = _cache["recent_requests"][-AVG_WINDOW:] if len(_cache["recent_requests"]) >= AVG_WINDOW else _cache["recent_requests"]
+        
+        gen_speed, avg_prompt_time, prompt_tps, avg_context, detail, count = _calculate_averages(window)
+
+        online = count > 0
+
+        _cache.update({
+            "lm_online": online,
+            "lm_gen_speed": gen_speed,
+            "lm_detail": detail,
+            "lm_ttft": f"{avg_prompt_time:.0f} ms" if avg_prompt_time != "—" else "—",
+            "lm_prompt_tps": prompt_tps,
+            "lm_context_size": avg_context,
+            "lm_ts": now,
+        })
+        
+        print(f"📊 Log scan complete: {count} requests parsed")
     
     return (
         _cache["lm_online"],
@@ -990,6 +871,8 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   /* Update button styling */
   .update-btn {{ position: fixed; bottom: 140px; right: 20px; background: #007aff; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
   .update-btn:hover {{ opacity: 1; }}
+  .forward-btn {{ position: fixed; bottom: 220px; right: 20px; background: #0a84ff; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
+  .forward-btn:hover {{ opacity: 1; }}
   .update-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
   /* Model info button styling */
   .info-btn {{ position: fixed; bottom: 180px; right: 20px; background: #5856d6; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
@@ -1007,6 +890,26 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   /* GPU card styling */
   .gpu-util {{ color: #bf5af2; }}
   .gpu-temp {{ font-size: 1.3em; font-weight: 600; }}
+  /* Compact layout */
+  body {{ padding: 20px 16px 80px; }}
+  .card {{ padding: 12px 16px; margin-bottom: 10px; }}
+  .value {{ font-size: 1.8em; }}
+  .ttft-value {{ font-size: 1.4em; }}
+  h2 {{ font-size: 0.75em; margin-bottom: 4px; }}
+  .sub {{ font-size: 0.8em; }}
+  .header h1 {{ font-size: 1.2em; margin-bottom: 16px; }}
+  .footer {{ margin-top: 20px; font-size: 0.7em; }}
+  /* Mobile responsive */
+  @media (max-width: 600px) {{
+    body {{ padding: 12px 10px 50px; }}
+    .card {{ padding: 10px 12px; margin-bottom: 8px; }}
+    .value {{ font-size: 1.5em; }}
+    .ttft-value {{ font-size: 1.2em; }}
+    h2 {{ font-size: 0.7em; }}
+    .sub {{ font-size: 0.75em; }}
+    .header h1 {{ font-size: 1em; }}
+    .footer {{ font-size: 0.65em; }}
+  }}
   /* Capture button styling */
   .capture-btn {{ position: fixed; bottom: 220px; right: 20px; background: #30d158; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
   .capture-btn:hover {{ opacity: 1; }}
@@ -1034,9 +937,9 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   </div>
 
   <div class="card">
-    <h2><span class="status-dot"></span>Avg Time to First Token (TTFT)</h2>
+    <h2><span class="status-dot"></span>Avg Prompt Processing Time</h2>
     <div class="ttft-value">{lm_ttft}</div>
-    <div class="sub">Average time from request start until first output token arrives</div>
+    <div class="sub">Avg time LM Studio spent processing prompt tokens before generation</div>
   </div>
 
   <div class="footer">
@@ -1055,10 +958,9 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   </div>
 
   <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()">&#x1F41B;</button>
-
   <button class="info-btn" id="infoBtn" title="Show model info (free, no inference)" onclick="showModelInfo()">&#x1F4CB;</button>
   <button class="update-btn" id="updateBtn" title="Update from GitHub" onclick="updateServer()">&#x1F504;</button>
-  <button class="capture-btn" id="captureBtn" title="Capture network packets" onclick="toggleCapture()">&#x1F4E6;</button>
+  <button class="forward-btn" id="forwardBtn" title="Forward logs for debugging" onclick="forwardLogs()">&#x1F4E4;</button>
 
   <script>
     // HTML escape helper
@@ -1164,61 +1066,38 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
         }});
     }}
 
-    // Toggle packet capture
-    let captureActive = false;
-    function toggleCapture() {{
-      const btn = document.getElementById('captureBtn');
+    // Forward logs for debugging
+    function forwardLogs() {{
+      const btn = document.getElementById('forwardBtn');
+      btn.innerHTML = '&#x23F3;'; // hourglass
+      btn.title = 'Fetching logs...';
       
-      if (!captureActive) {{
-        // Start capture
-        btn.innerHTML = '&#x1F534;'; // red dot
-        btn.classList.add('active');
-        btn.title = 'Stop capture';
-        
-        fetch('/api/capture/start')
-          .then(response => response.json())
-          .then(data => {{
-            captureActive = true;
-            console.log('Capture started:', data.message);
-          }})
-          .catch(error => {{
-            console.error('Failed to start capture:', error);
-            btn.innerHTML = '&#x1F4E6;';
-            btn.classList.remove('active');
-            btn.title = 'Capture failed';
-          }});
-      }} else {{
-        // Stop capture
-        btn.innerHTML = '&#x1F4E6;'; // envelope
-        btn.classList.remove('active');
-        btn.title = 'Capture packets';
-        
-        fetch('/api/capture/stop')
-          .then(response => response.json())
-          .then(data => {{
-            captureActive = false;
-            console.log('Capture stopped:', data.message);
-            // Reload to show stats
-            setTimeout(() => {{ location.reload(); }}, 500);
-          }})
-          .catch(error => {{
-            console.error('Failed to stop capture:', error);
-            btn.innerHTML = '&#x1F4E6;';
-            btn.classList.remove('active');
-          }});
-      }}
+      fetch('/api/log_forward')
+        .then(response => response.json())
+        .then(data => {{
+          if (data.error) {{
+            alert('❌ ' + data.error);
+            btn.innerHTML = '&#x1F4E4;';
+            btn.title = 'Forward logs for debugging';
+          }} else {{
+            const logContent = document.createElement('div');
+            logContent.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#1c1c1e;color:#fff;padding:20px;border-radius:10px;max-width:80%;max-height:70%;overflow:auto;font-family:monospace;font-size:12px;z-index:10000;box-shadow:0 4px 20px rgba(0,0,0,0.8)';
+            logContent.innerHTML = '<div style="margin-bottom:10px;font-weight:bold;font-size:14px;">📋 Log Forward — ' + data.file + '</div><pre style="white-space:pre-wrap;word-break:break-all;">' + escapeHtml(data.content) + '</pre><div style="margin-top:10px;text-align:right;"><button onclick="this.parentElement.parentElement.remove()" style="background:#0a84ff;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;">Close</button></div>';
+            document.body.appendChild(logContent);
+            btn.innerHTML = '&#x1F4E4;';
+            btn.title = 'Forward logs for debugging';
+          }}
+        }})
+        .catch(error => {{
+          alert('❌ Failed to fetch logs: ' + error.message);
+          btn.innerHTML = '&#x1F4E4;';
+          btn.title = 'Forward logs for debugging';
+        }});
     }}
-    
-    // Auto-stop capture when leaving page
-    window.addEventListener('beforeunload', function() {{
-      if (captureActive) {{
-        fetch('/api/capture/stop');
-      }}
-    }});
 
     // Reset aggregation window
     function resetAvg() {{
-      if (!confirm('Reset the running average of last {AVG_WINDOW} requests? This will clear cached stats and re-probe.')) return;
+      if (!confirm('Reset the running average of last {AVG_WINDOW} requests? This will clear cached stats and re-scan logs.')) return;
       fetch('/reset_avg')
         .then(() => {{ location.reload(); }})
         .catch(() => {{ alert('Failed to reset'); }});
@@ -1313,37 +1192,6 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
             self.send_header("Content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(status_data, indent=2).encode())
-
-        elif self.path == "/api/capture/start":
-            # Start packet capture
-            _start_capture()
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({
-                "status": "success",
-                "message": "Packet capture started"
-            }).encode())
-
-        elif self.path == "/api/capture/stop":
-            # Stop packet capture
-            _stop_capture()
-            _save_capture_stats()
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({
-                "status": "success",
-                "message": "Packet capture stopped"
-            }).encode())
-
-        elif self.path == "/api/capture/stats":
-            # Return captured stats
-            stats = _get_capture_stats()
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(stats, indent=2).encode())
 
         elif self.path == "/api/rollback":
             # Manual rollback endpoint
@@ -1498,13 +1346,17 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
         
-        elif self.path == "/api/lm_info":
-            # On-demand: fetch LM Studio model metadata (free, no inference)
-            info = get_lm_studio_info()
+        elif self.path == "/reset_avg":
+            # Reset aggregation window: clear all metrics and mark fresh-start so we skip log scanning
+            _cache["recent_requests"] = []
+            for key in list(_cache.keys()):
+                if key.startswith("lm_"):
+                    del _cache[key]
+            print("🔄 Aggregation reset — cleared all stats; dashboard will show empty until new completions arrive")
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(info, indent=2).encode())
+            self.wfile.write(json.dumps({"status": "reset"}).encode())
 
         elif self.path == "/api/health":
             # Health check endpoint
@@ -1522,17 +1374,33 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
                 "uptime_seconds": int(time.time() - _START_TIME),
             }).encode())
 
-        elif self.path == "/reset_avg":
-            # Reset aggregation window: clear all metrics and mark fresh-start so we skip API calls
-            _cache["recent_probes"] = []
-            for key in list(_cache.keys()):
-                if key.startswith("lm_"):
-                    del _cache[key]
-            print("🔄 Aggregation reset — cleared all stats; dashboard will show empty until new probes complete")
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "reset"}).encode())
+        elif self.path == "/api/log_forward":
+            # Forward log content to dashboard for debugging parsing issues
+            log_files = _find_log_files()
+            if not log_files:
+                self.send_response(404)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "No log files found"}).encode())
+            else:
+                # Read last 100 lines from newest log file
+                newest = log_files[0]
+                try:
+                    with open(newest, "r", errors="replace") as f:
+                        lines = f.readlines()[-100:]
+                    self.send_response(200)
+                    self.send_header("Content-type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "file": newest,
+                        "lines": len(lines),
+                        "content": "".join(lines)
+                    }).encode())
+                except Exception as e:
+                    self.send_response(500)
+                    self.send_header("Content-type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
 
         elif self.path.startswith("/debug/toggle"):
             # Parse query string: /debug/toggle?enable=1 or /debug/toggle?enable=0
