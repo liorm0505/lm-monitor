@@ -1028,12 +1028,6 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   </div>
 
   <div class="card">
-    <h2><span class="status-dot"></span>GPU Utilization</h2>
-    <div class="value gpu-util">{gpu_util}</div>
-    <div class="sub">{gpu_temp} · Apple Silicon Neural Engine + GPU (Metal)</div>
-  </div>
-
-  <div class="card">
     <h2><span class="status-dot"></span>Avg Generation Speed</h2>
     <div class="value">{lm_gen_speed}</div>
     <div class="sub">{lm_detail}</div>
