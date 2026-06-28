@@ -1697,12 +1697,29 @@ if __name__ == "__main__":
             "lm_ts": time.time(),
         })
     
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+    allow_reuse_port = True
+
+
+if __name__ == "__main__":
+    # Validate script on startup — auto-rollback if broken
+    if not _validate_script():
+        print("❌ Script validation failed — attempting auto-rollback...")
+        backup_path = _get_latest_backup()
+        if backup_path and _restore_backup(backup_path):
+            print("✅ Rolled back to previous version. Restarting...")
+            os.execv(sys.executable, [sys.executable, __file__])
+        else:
+            print("❌ No backup available to roll back to. Exiting.")
+            sys.exit(1)
+
     # Start the background log server (survives dashboard crashes)
     _start_log_server()
     print(f"📂 Log server started on port 8081 — I can read crash/debug logs remotely")
     
     try:
-        with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        with ReusableTCPServer(("", PORT), Handler) as httpd:
             httpd.serve_forever()
     except KeyboardInterrupt:
         pass
