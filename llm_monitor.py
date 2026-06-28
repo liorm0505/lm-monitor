@@ -31,6 +31,12 @@ from io import StringIO
 import urllib.request  # stdlib — always available on Python 3.9+
 import urllib.error    # stdlib — always available on Python 3.9+
 
+try:
+    from scapy.all import sniff, TCP, IP, Raw, wrpcap
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+
 # Guarded psutil import — available in module scope for all functions
 try:
     import psutil
@@ -127,6 +133,168 @@ CACHE_TTL       = 5                         # Seconds between API probes
 AVG_WINDOW      = 10                        # Running average over last N probe results
 BACKUP_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
 MAX_BACKUPS     = 5                         # Keep last N backups
+CAPTURE_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+CAPTURE_STATS   = os.path.join(CAPTURE_DIR, "capture_stats.json")
+CAPTURE_LM_PORT = 1234                    # LM Studio API port
+
+# Network capture state
+capture_active = False
+capture_thread = None
+capture_stats = []
+capture_lock = threading.Lock()
+
+# ──────────────────────────────────────────────
+# Network packet capture — lightweight scapy-based
+# ──────────────────────────────────────────────
+
+def _parse_http_response(raw_bytes):
+    """Parse HTTP response to extract JSON body and timing info."""
+    try:
+        text = raw_bytes.decode('utf-8', errors='ignore')
+        # Find JSON body (after \r\n\r\n)
+        if '\\r\\n\\r\\n' in text:
+            json_start = text.index('\\r\\n\\r\\n') + 4
+            json_body = text[json_start:]
+            return json.loads(json_body)
+        elif '{' in text:
+            return json.loads(text[text.index('{'):])
+    except (json.JSONDecodeError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _packet_callback(pkt):
+    """Callback for scapy packet capture."""
+    global capture_stats
+    
+    if not pkt.haslayer(TCP) or not pkt.haslayer(IP):  # type: ignore
+        return
+    
+    # Filter for LM Studio port (1234)
+    dst_port = pkt[TCP].dport  # type: ignore
+    src_port = pkt[TCP].sport  # type: ignore
+    
+    if dst_port != CAPTURE_LM_PORT and src_port != CAPTURE_LM_PORT:
+        return
+    
+    # Only capture TCP payload (HTTP data)
+    if not pkt.haslayer(Raw):  # type: ignore
+        return
+    
+    payload = bytes(pkt[Raw].load)  # type: ignore
+    
+    # Detect response packets (port 1234 is the destination for requests, so responses come FROM 1234)
+    if dst_port == CAPTURE_LM_PORT:
+        # This is a request - we'll capture timing from the response
+        return
+    
+    # This is a response from LM Studio
+    with capture_lock:
+        now = time.time()
+        json_data = _parse_http_response(payload)
+        
+        stat = {
+            'timestamp': now,
+            'dst_port': dst_port,
+            'src_port': src_port,
+            'size': len(payload),
+            'json_data': json_data
+        }
+        
+        # Extract token usage if available
+        if json_data and isinstance(json_data, dict):
+            usage = json_data.get('usage', {})
+            if usage:
+                stat['input_tokens'] = usage.get('prompt_tokens', 0)
+                stat['output_tokens'] = usage.get('completion_tokens', 0)
+                stat['total_tokens'] = usage.get('total_tokens', 0)
+        
+        capture_stats.append(stat)
+        
+        # Keep only last 1000 stats to prevent memory issues
+        if len(capture_stats) > 1000:
+            capture_stats = capture_stats[-500:]
+
+
+def _start_capture():
+    """Start network packet capture in background thread."""
+    global capture_active, capture_thread, capture_stats
+    
+    if capture_active:
+        return
+    
+    if not SCAPY_AVAILABLE:
+        log_debug("scapy not available — packet capture disabled")
+        return
+    
+    with capture_lock:
+        capture_stats = []
+        capture_active = True
+    
+    # Start capture thread
+    def capture_worker():
+        try:
+            log_debug("📡 Starting packet capture on port " + str(CAPTURE_LM_PORT))
+            sniff(
+                filter=f"tcp port {CAPTURE_LM_PORT}",
+                prn=_packet_callback,
+                store=False,
+                stop_filter=lambda p: not capture_active
+            )
+        except Exception as e:
+            log_debug(f"Packet capture error: {type(e).__name__}: {e}")
+        finally:
+            with capture_lock:
+                capture_active = False
+    
+    capture_thread = threading.Thread(target=capture_worker, daemon=True)
+    capture_thread.start()
+
+
+def _stop_capture():
+    """Stop network packet capture."""
+    global capture_active
+    
+    with capture_lock:
+        capture_active = False
+    
+    log_debug("📡 Packet capture stopped")
+
+
+def _get_capture_stats():
+    """Return captured stats as JSON."""
+    with capture_lock:
+        if not capture_stats:
+            return {
+                'count': 0,
+                'avg_input_tokens': 0,
+                'avg_output_tokens': 0,
+                'total_requests': 0,
+                'errors': 0
+            }
+        
+        total_input = sum(s.get('input_tokens', 0) for s in capture_stats)
+        total_output = sum(s.get('output_tokens', 0) for s in capture_stats)
+        error_count = sum(1 for s in capture_stats if s.get('error'))
+        
+        return {
+            'count': len(capture_stats),
+            'avg_input_tokens': total_input / len(capture_stats) if capture_stats else 0,
+            'avg_output_tokens': total_output / len(capture_stats) if capture_stats else 0,
+            'total_requests': len(capture_stats),
+            'errors': error_count
+        }
+
+
+def _save_capture_stats():
+    """Save capture stats to JSON file."""
+    try:
+        os.makedirs(CAPTURE_DIR, exist_ok=True)
+        with open(CAPTURE_STATS, 'w') as f:
+            json.dump(capture_stats, f, indent=2, default=str)
+        log_debug(f"Capture stats saved to {CAPTURE_STATS}")
+    except Exception as e:
+        log_debug(f"Failed to save capture stats: {type(e).__name__}: {e}")
 
 
 # ──────────────────────────────────────────────
@@ -839,6 +1007,10 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   /* GPU card styling */
   .gpu-util {{ color: #bf5af2; }}
   .gpu-temp {{ font-size: 1.3em; font-weight: 600; }}
+  /* Capture button styling */
+  .capture-btn {{ position: fixed; bottom: 220px; right: 20px; background: #30d158; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
+  .capture-btn:hover {{ opacity: 1; }}
+  .capture-btn.active {{ background: #ff453a; opacity: 1; }}
 </style>
 </head>
 <body>
@@ -892,6 +1064,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
 
   <button class="info-btn" id="infoBtn" title="Show model info (free, no inference)" onclick="showModelInfo()">&#x1F4CB;</button>
   <button class="update-btn" id="updateBtn" title="Update from GitHub" onclick="updateServer()">&#x1F504;</button>
+  <button class="capture-btn" id="captureBtn" title="Capture network packets" onclick="toggleCapture()">&#x1F4E6;</button>
 
   <script>
     // HTML escape helper
@@ -997,6 +1170,58 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
         }});
     }}
 
+    // Toggle packet capture
+    let captureActive = false;
+    function toggleCapture() {{
+      const btn = document.getElementById('captureBtn');
+      
+      if (!captureActive) {{
+        // Start capture
+        btn.innerHTML = '&#x1F534;'; // red dot
+        btn.classList.add('active');
+        btn.title = 'Stop capture';
+        
+        fetch('/api/capture/start')
+          .then(response => response.json())
+          .then(data => {{
+            captureActive = true;
+            console.log('Capture started:', data.message);
+          }})
+          .catch(error => {{
+            console.error('Failed to start capture:', error);
+            btn.innerHTML = '&#x1F4E6;';
+            btn.classList.remove('active');
+            btn.title = 'Capture failed';
+          }});
+      }} else {{
+        // Stop capture
+        btn.innerHTML = '&#x1F4E6;'; // envelope
+        btn.classList.remove('active');
+        btn.title = 'Capture packets';
+        
+        fetch('/api/capture/stop')
+          .then(response => response.json())
+          .then(data => {{
+            captureActive = false;
+            console.log('Capture stopped:', data.message);
+            // Reload to show stats
+            setTimeout(() => {{ location.reload(); }}, 500);
+          }})
+          .catch(error => {{
+            console.error('Failed to stop capture:', error);
+            btn.innerHTML = '&#x1F4E6;';
+            btn.classList.remove('active');
+          }});
+      }}
+    }}
+    
+    // Auto-stop capture when leaving page
+    window.addEventListener('beforeunload', function() {{
+      if (captureActive) {{
+        fetch('/api/capture/stop');
+      }}
+    }});
+
     // Reset aggregation window
     function resetAvg() {{
       if (!confirm('Reset the running average of last {AVG_WINDOW} requests? This will clear cached stats and re-probe.')) return;
@@ -1094,6 +1319,37 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
             self.send_header("Content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(status_data, indent=2).encode())
+
+        elif self.path == "/api/capture/start":
+            # Start packet capture
+            _start_capture()
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success",
+                "message": "Packet capture started"
+            }).encode())
+
+        elif self.path == "/api/capture/stop":
+            # Stop packet capture
+            _stop_capture()
+            _save_capture_stats()
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success",
+                "message": "Packet capture stopped"
+            }).encode())
+
+        elif self.path == "/api/capture/stats":
+            # Return captured stats
+            stats = _get_capture_stats()
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(stats, indent=2).encode())
 
         elif self.path == "/api/rollback":
             # Manual rollback endpoint
