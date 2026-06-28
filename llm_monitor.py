@@ -1013,6 +1013,8 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
 # ──────────────────────────────────────────────
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    allow_reuse_address = True
+    
     def do_GET(self):
         # Auto-reload: if the script file changed since we started, restart ourselves
         global _SCRIPT_MTIME_START
