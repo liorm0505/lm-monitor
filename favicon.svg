@@ -1,0 +1,5 @@
+<!-- Simple lightning bolt favicon -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect width="100" height="100" fill="#1a1a1a" rx="15"/>
+  <path d="M55 15L30 55H48L42 85L70 42H52L55 15Z" fill="#ff9f0a" stroke="#ff9f0a" stroke-width="2"/>
+</svg>

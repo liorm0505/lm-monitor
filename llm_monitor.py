@@ -24,6 +24,7 @@ import subprocess
 import time
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 import traceback
 from io import StringIO
@@ -124,6 +125,124 @@ LM_STUDIO_URL   = os.environ.get("LM_STUDIO_URL", "http://localhost:1234")   # L
 PORT            = 8080                      # Dashboard HTTP port
 CACHE_TTL       = 5                         # Seconds between API probes
 AVG_WINDOW      = 10                        # Running average over last N probe results
+BACKUP_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+MAX_BACKUPS     = 5                         # Keep last N backups
+
+
+# ──────────────────────────────────────────────
+# Backup management — timestamped script backups for rollback
+# ──────────────────────────────────────────────
+
+def _create_backup():
+    """Create a timestamped backup of the current script.
+    
+    Returns backup path or None on failure.
+    """
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(BACKUP_DIR, f"llm_monitor_{timestamp}.py")
+        
+        # Copy current script to backup
+        with open(_SCRIPT_PATH, "r", encoding="utf-8") as src:
+            content = src.read()
+        with open(backup_path, "w", encoding="utf-8") as dst:
+            dst.write(content)
+        
+        log_debug(f"Backup created: {backup_path}")
+        return backup_path
+    except Exception as e:
+        log_debug(f"Backup creation failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _cleanup_old_backups():
+    """Remove oldest backups keeping only MAX_BACKUPS most recent."""
+    try:
+        if not os.path.exists(BACKUP_DIR):
+            return
+        
+        backups = sorted([
+            f for f in os.listdir(BACKUP_DIR) 
+            if f.startswith("llm_monitor_") and f.endswith(".py")
+        ])
+        
+        # Remove oldest if we have more than MAX_BACKUPS
+        while len(backups) > MAX_BACKUPS:
+            oldest = backups.pop(0)
+            os.remove(os.path.join(BACKUP_DIR, oldest))
+            log_debug(f"Removed old backup: {oldest}")
+    except Exception as e:
+        log_debug(f"Backup cleanup failed: {type(e).__name__}: {e}")
+
+
+def _get_latest_backup():
+    """Return path to the most recent backup, or None if no backups exist."""
+    try:
+        if not os.path.exists(BACKUP_DIR):
+            return None
+        
+        backups = sorted([
+            f for f in os.listdir(BACKUP_DIR) 
+            if f.startswith("llm_monitor_") and f.endswith(".py")
+        ])
+        
+        if not backups:
+            return None
+        
+        return os.path.join(BACKUP_DIR, backups[-1])
+    except Exception as e:
+        log_debug(f"Backup lookup failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _restore_backup(backup_path):
+    """Restore script from a backup file.
+    
+    Returns True on success, False on failure.
+    """
+    try:
+        if not os.path.exists(backup_path):
+            log_debug(f"Backup file not found: {backup_path}")
+            return False
+        
+        with open(backup_path, "r", encoding="utf-8") as src:
+            content = src.read()
+        with open(_SCRIPT_PATH, "w", encoding="utf-8") as dst:
+            dst.write(content)
+        
+        log_debug(f"Restored from backup: {backup_path}")
+        return True
+    except Exception as e:
+        log_debug(f"Restore failed: {type(e).__name__}: {e}")
+        return False
+
+
+def _validate_script():
+    """Check if the current script compiles successfully.
+    
+    Returns True if valid, False if syntax error or import issue.
+    """
+    try:
+        # Try to compile the script
+        with open(_SCRIPT_PATH, "r", encoding="utf-8") as f:
+            code = f.read()
+        compile(code, _SCRIPT_PATH, "exec")
+        
+        # Try to import required modules
+        import psutil
+        import requests
+        
+        return True
+    except SyntaxError as e:
+        log_debug(f"Syntax error in script: {e}")
+        return False
+    except ImportError as e:
+        log_debug(f"Missing import: {e}")
+        return False
+    except Exception as e:
+        log_debug(f"Validation error: {type(e).__name__}: {e}")
+        return False
 
 
 # ──────────────────────────────────────────────
@@ -162,8 +281,10 @@ def _probe_lm_studio():
     )
 
     try:
+        start_time = time.time()
         with urllib.request.urlopen(req, timeout=10) as resp:
             body = json.loads(resp.read().decode("utf-8"))
+        elapsed_s = time.time() - start_time
         
         # Extract stats from response
         stats = body.get("stats") or {}  # LM Studio native API
@@ -171,6 +292,7 @@ def _probe_lm_studio():
         gen_speed = None
         ttft_ms = None
         
+        # 1. Try LM Studio native stats format
         if "tokens_per_second" in stats:
             tps = stats["tokens_per_second"]
             if tps > 0:
@@ -180,15 +302,22 @@ def _probe_lm_studio():
             ttft_s = stats["time_to_first_token_seconds"]
             ttft_ms = ttft_s * 1000
 
-        # Also check OpenAI-compatible response format (data.choices[0].usage)
-        if gen_speed is None and "choices" in body:
-            usage = body["choices"][0].get("usage", {}) or {}
+        # 2. Fallback: calculate from OpenAI-compatible response + timing
+        if gen_speed is None or ttft_ms is None:
+            usage = body.get("usage", {}) or {}
             prompt_tokens = usage.get("prompt_tokens", 0) or 0
             completion_tokens = usage.get("completion_tokens", 0) or 0
+            total_tokens = usage.get("total_tokens", 0) or 0
             
-            # If we have timing info somewhere, use it
-            if "total_time" in stats and prompt_tokens > 0:
-                ttft_ms = (stats["total_time"] / max(prompt_tokens + completion_tokens, 1)) * 1000
+            # Calculate generation speed from elapsed time
+            if completion_tokens > 0 and elapsed_s > 0:
+                gen_speed = completion_tokens / elapsed_s
+            
+            # Estimate TTFT: time minus generation time for remaining tokens
+            if completion_tokens > 0 and elapsed_s > 0 and prompt_tokens > 0:
+                # Simple estimate: TTFT ≈ total_time - (total_tokens / gen_speed)
+                # But since we only have 1 completion token, TTFT ≈ elapsed time
+                ttft_ms = elapsed_s * 1000
         
         return {"gen_speed_tps": gen_speed, "ttft_ms": ttft_ms}
 
@@ -610,7 +739,6 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
     commit_hash, commit_ts = _get_git_info()
     uptime = _uptime_str()
     logs_enabled = _cache.get("logs_enabled", False)
-    print(f"🐛 DEBUG RENDER: logs_enabled={logs_enabled} (raw cache={_cache.get('logs_enabled', 'MISSING')!r})")
     dbg_color = "#ff453a" if logs_enabled else "#8e8e93"  # Red when on, gray when off
     _state = "on" if logs_enabled else "off"
 
@@ -656,6 +784,10 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   .status-bar .uptime {{ color: #34c759; }}
   .debug-toggle {{ position: fixed; bottom: 80px; right: 20px; background: {dbg_color}; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
   .debug-toggle:hover {{ opacity: 1; }}
+  /* Update button styling */
+  .update-btn {{ position: fixed; bottom: 140px; right: 20px; background: #007aff; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
+  .update-btn:hover {{ opacity: 1; }}
+  .update-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
   /* GPU card styling */
   .gpu-util {{ color: #bf5af2; }}
   .gpu-temp {{ font-size: 1.3em; font-weight: 600; }}
@@ -708,7 +840,9 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
     <span>● running</span>
   </div>
 
-  <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()" data-state="{_state}">🐛</button>
+  <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()">&#x1F41B;</button>
+
+  <button class="update-btn" id="updateBtn" title="Update from GitHub" onclick="updateServer()" data-state="idle">&#x1F504;</button>
 
   <script>
     // Toggle debug logging on/off
@@ -718,6 +852,39 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
       fetch('/debug/toggle?enable=' + (isOn ? '0' : '1'))
         .then(() => {{ location.reload(); }})
         .catch(() => {{}});
+    }}
+
+    // Update from GitHub
+    function updateServer() {{
+      const btn = document.getElementById('updateBtn');
+      btn.disabled = true;
+      btn.innerHTML = '&#x23F3;'; // hourglass
+      btn.title = 'Updating...';
+      
+      fetch('/api/update')
+        .then(response => response.json())
+        .then(data => {{
+          if (data.status === 'success') {{
+            btn.innerHTML = '&#x2705;'; // checkmark
+            btn.title = 'Update successful!';
+            setTimeout(() => {{ location.reload(); }}, 1000);
+          }} else {{
+            btn.innerHTML = '&#x274C;'; // X
+            btn.title = 'Update failed: ' + data.error;
+            setTimeout(() => {{ 
+              btn.innerHTML = '&#x1F504;';
+              btn.disabled = false;
+            }}, 2000);
+          }}
+        }})
+        .catch(error => {{
+          btn.innerHTML = '&#x274C;';
+          btn.title = 'Update failed: ' + error.message;
+          setTimeout(() => {{ 
+            btn.innerHTML = '&#x1F504;';
+            btn.disabled = false;
+          }}, 2000);
+        }});
     }}
 
     // Reset aggregation window
@@ -813,6 +980,175 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
             self.send_header("Content-type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(status_data, indent=2).encode())
+
+        elif self.path == "/api/rollback":
+            # Manual rollback endpoint
+            backup_path = _get_latest_backup()
+            if not backup_path:
+                self.send_response(404)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "No backups found"}).encode())
+                return
+            
+            if _restore_backup(backup_path):
+                log_debug("Manual rollback successful")
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "status": "success",
+                    "message": f"Restored from {os.path.basename(backup_path)}",
+                    "backup_file": backup_path,
+                }).encode())
+            else:
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Restore failed"}).encode())
+        
+        elif self.path == "/api/update":
+            # Self-update: git pull + validate + swap + restart
+            # This is the main entry point for the "Update" button
+            log_debug("🔄 Update initiated via /api/update")
+            
+            # Step 1: Create backup of current script
+            backup_path = _create_backup()
+            if not backup_path:
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "status": "failed",
+                    "error": "Backup creation failed",
+                }).encode())
+                return
+            
+            # Step 2: Try git pull
+            try:
+                result = subprocess.run(
+                    ["git", "pull", "origin", "main"],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=os.path.dirname(_SCRIPT_PATH) or "."
+                )
+                
+                if result.returncode != 0:
+                    log_debug(f"git pull failed: {result.stderr}")
+                    # Rollback if pull fails
+                    _restore_backup(backup_path)
+                    self.send_response(500)
+                    self.send_header("Content-type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "status": "failed",
+                        "error": f"git pull failed: {result.stderr[:200]}",
+                    }).encode())
+                    return
+                
+                log_debug(f"git pull successful: {result.stdout[:100]}")
+            except subprocess.TimeoutExpired:
+                log_debug("git pull timed out")
+                _restore_backup(backup_path)
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "status": "failed",
+                    "error": "git pull timed out",
+                }).encode())
+                return
+            except Exception as e:
+                log_debug(f"git pull error: {type(e).__name__}: {e}")
+                _restore_backup(backup_path)
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "status": "failed",
+                    "error": f"git pull error: {type(e).__name__}",
+                }).encode())
+                return
+            
+            # Step 3: Validate the new script
+            if not _validate_script():
+                log_debug("Validation failed after git pull")
+                _restore_backup(backup_path)
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "status": "failed",
+                    "error": "Script validation failed after update",
+                }).encode())
+                return
+            
+            # Step 4: Cleanup old backups
+            _cleanup_old_backups()
+            
+            # Step 5: Signal restart (we'll restart after sending response)
+            log_debug("✅ Update successful — restarting server...")
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success",
+                "message": "Update successful — restarting server...",
+                "backup_created": backup_path,
+            }).encode())
+            
+            # Restart the server in a new process
+            time.sleep(1)  # Give client time to receive response
+            os.execv(sys.executable, [sys.executable, __file__])
+        
+        elif self.path == "/api/backup/list":
+            # List available backups
+            try:
+                if not os.path.exists(BACKUP_DIR):
+                    backups = []
+                else:
+                    backups = sorted([
+                        f for f in os.listdir(BACKUP_DIR) 
+                        if f.startswith("llm_monitor_") and f.endswith(".py")
+                    ])
+                
+                backup_info = []
+                for b in backups:
+                    path = os.path.join(BACKUP_DIR, b)
+                    stat = os.stat(path)
+                    backup_info.append({
+                        "filename": b,
+                        "size_bytes": stat.st_size,
+                        "timestamp": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    })
+                
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "backups": backup_info,
+                    "count": len(backup_info),
+                }).encode())
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+        
+        elif self.path == "/api/health":
+            # Health check endpoint
+            is_valid = _validate_script()
+            latest_backup = _get_latest_backup()
+            
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "healthy" if is_valid else "unhealthy",
+                "script_valid": is_valid,
+                "has_backup": latest_backup is not None,
+                "backup_path": latest_backup,
+                "uptime_seconds": int(time.time() - _START_TIME),
+            }).encode())
 
         elif self.path == "/reset_avg":
             # Reset aggregation window: clear all metrics and mark fresh-start so we skip API calls
@@ -948,11 +1284,24 @@ if __name__ == "__main__":
     
     print("Press Ctrl+C to stop.")
     
-    # Verify LM Studio API is reachable on startup
+    # Auto-rollback: if script is invalid, restore from backup
+    if not _validate_script():
+        print("⚠️  Script validation failed — attempting rollback...")
+        backup_path = _get_latest_backup()
+        if backup_path:
+            print(f"   Restoring from backup: {os.path.basename(backup_path)}")
+            if _restore_backup(backup_path):
+                print("✅ Rollback successful — restarting with backup...")
+                os.execv(sys.executable, [sys.executable, __file__])
+            else:
+                print("❌ Rollback failed — continuing with broken script")
+        else:
+            print("❌ No backups available — continuing with broken script")
+    
+    # Seed cache with one startup probe (no warning — LM Studio may start later)
     probe_result = _probe_lm_studio()
     if probe_result and probe_result.get("gen_speed_tps"):
         print(f"✅ LM Studio API reachable — gen speed: {probe_result['gen_speed_tps']:.1f} tok/s")
-        # Seed the cache with this first result so dashboard shows something immediately
         _cache.update({
             "lm_online": True,
             "lm_gen_speed": f"{probe_result['gen_speed_tps']:.1f} tok/s",
@@ -961,8 +1310,14 @@ if __name__ == "__main__":
             "lm_ts": time.time(),
         })
     else:
-        print(f"⚠️  LM Studio API not reachable at {LM_STUDIO_URL}")
-        print("   Make sure LM Studio server is running (Developer → Status: Running)")
+        # Don't warn — LM Studio often starts after the monitor. Just seed cache offline.
+        _cache.update({
+            "lm_online": False,
+            "lm_gen_speed": "—",
+            "lm_detail": f"LM Studio not reachable at {LM_STUDIO_URL} (will re-probe every {CACHE_TTL}s)",
+            "lm_ttft": "—",
+            "lm_ts": time.time(),
+        })
     
     # Start the background log server (survives dashboard crashes)
     _start_log_server()
