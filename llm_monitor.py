@@ -1037,6 +1037,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_header("Content-type", "text/html")
                 self.end_headers()
                 self.wfile.write(html.encode())
+            except BrokenPipeError:
+                pass  # Client disconnected, ignore
             except Exception as e:
                 print(f"❌ ERROR serving /: {type(e).__name__}: {e}")
                 import traceback; traceback.print_exc()
