@@ -894,6 +894,13 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   <button class="update-btn" id="updateBtn" title="Update from GitHub" onclick="updateServer()">&#x1F504;</button>
 
   <script>
+    // HTML escape helper
+    function escapeHtml(str) {{
+      const div = document.createElement('div');
+      div.appendChild(document.createTextNode(str));
+      return div.innerHTML;
+    }}
+
     // Toggle debug logging on/off
     function toggleDebug() {{
       const btn = document.getElementById('debugBtn');
@@ -925,18 +932,18 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
         .then(data => {{
           const content = document.getElementById('infoContent');
           if (data.error) {{
-            content.innerHTML = `<div class="info-row"><span class="info-label">Status</span><span class="info-value" style="color: #ff3b30;">❌ ${data.error}</span></div>`;
+            content.innerHTML = '<div class="info-row"><span class="info-label">Status</span><span class="info-value" style="color: #ff3b30;">❌ </span>' + escapeHtml(data.error) + '</div>';
           }} else {{
             let html = '';
-            if (data.name) html += `<div class="info-row"><span class="info-label">Model</span><span class="info-value">${data.name}</span></div>`;
+            if (data.name) html += '<div class="info-row"><span class="info-label">Model</span><span class="info-value">' + escapeHtml(data.name) + '</span></div>';
             if (data.context_length && data.context_length !== 'Unknown') {{
               const ctxNum = parseInt(data.context_length);
               const ctxPercent = data.context_length !== 'Unknown' ? ((128000 / ctxNum) * 100).toFixed(1) : '—';
-              html += `<div class="info-row"><span class="info-label">Max Context</span><span class="info-value">${data.context_length} tokens (${ctxPercent}% of 128k)</span></div>`;
+              html += '<div class="info-row"><span class="info-label">Max Context</span><span class="info-value">' + escapeHtml(data.context_length) + ' tokens (' + ctxPercent + '% of 128k)</span></div>';
             }}
-            if (data.object) html += `<div class="info-row"><span class="info-label">Type</span><span class="info-value">${data.object}</span></div>`;
-            if (data.online) html += `<div class="info-row"><span class="info-label">Status</span><span class="info-value" style="color: #34c759;">✅ Online</span></div>`;
-            if (!data.online) html += `<div class="info-row"><span class="info-label">Status</span><span class="info-value" style="color: #ff3b30;">❌ Offline</span></div>`;
+            if (data.object) html += '<div class="info-row"><span class="info-label">Type</span><span class="info-value">' + escapeHtml(data.object) + '</span></div>';
+            if (data.online) html += '<div class="info-row"><span class="info-label">Status</span><span class="info-value" style="color: #34c759;">✅ Online</span></div>';
+            if (!data.online) html += '<div class="info-row"><span class="info-label">Status</span><span class="info-value" style="color: #ff3b30;">❌ Offline</span></div>';
             content.innerHTML = html;
           }}
           btn.innerHTML = '&#x1F4CB;';
@@ -944,7 +951,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
         }})
         .catch(error => {{
           const content = document.getElementById('infoContent');
-          content.innerHTML = `<div class="info-row"><span class="info-label">Error</span><span class="info-value" style="color: #ff3b30;">❌ ${error.message}</span></div>`;
+          content.innerHTML = '<div class="info-row"><span class="info-label">Error</span><span class="info-value" style="color: #ff3b30;">❌ </span>' + escapeHtml(error.message) + '</div>';
           btn.innerHTML = '&#x1F4CB;';
           btn.disabled = false;
         }});
