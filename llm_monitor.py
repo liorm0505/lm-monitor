@@ -345,6 +345,41 @@ def _probe_lm_studio_batch(n=3):
 
 
 # ──────────────────────────────────────────────
+# LM Studio model info — free metadata probe (no inference)
+# ──────────────────────────────────────────────
+
+def get_lm_studio_info():
+    """Fetch model metadata from LM Studio without triggering inference.
+    
+    Calls GET /v1/models which returns model name, context_length, etc.
+    Zero token cost — pure metadata.
+    
+    Returns dict with: name, context_length, object type, or error message.
+    """
+    try:
+        url = f"{LM_STUDIO_URL}/v1/models"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        
+        models = data.get("data", [])
+        if models:
+            m = models[0]
+            ctx = m.get("context_length")
+            return {
+                "name": m.get("id", "Unknown"),
+                "context_length": ctx if ctx else "Unknown",
+                "object": m.get("object", "model"),
+                "online": True,
+            }
+        return {"error": "No models loaded in LM Studio", "online": True}
+    except urllib.error.URLError as e:
+        return {"error": f"LM Studio unreachable: {e}", "online": False}
+    except Exception as e:
+        return {"error": f"Failed to fetch model info: {type(e).__name__}: {e}", "online": False}
+
+
+# ──────────────────────────────────────────────
 # Cache state — prevents frequent API calls on page reloads
 # ──────────────────────────────────────────────
 _cache = {
@@ -788,6 +823,19 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   .update-btn {{ position: fixed; bottom: 140px; right: 20px; background: #007aff; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
   .update-btn:hover {{ opacity: 1; }}
   .update-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  /* Model info button styling */
+  .info-btn {{ position: fixed; bottom: 180px; right: 20px; background: #5856d6; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
+  .info-btn:hover {{ opacity: 1; }}
+  .info-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  /* Model info popup */
+  .info-popup {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #2d2d2d; border-radius: 14px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 1000; min-width: 300px; max-width: 400px; }}
+  .info-popup h3 {{ margin: 0 0 16px; color: #fff; font-size: 1.1em; }}
+  .info-popup .info-row {{ display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #3d3d3d; }}
+  .info-popup .info-label {{ color: #888; font-size: 0.9em; }}
+  .info-popup .info-value {{ color: #fff; font-weight: 600; }}
+  .info-popup .close-btn {{ position: absolute; top: 12px; right: 12px; background: none; border: none; color: #888; font-size: 1.2em; cursor: pointer; }}
+  .info-popup .close-btn:hover {{ color: #fff; }}
+  .info-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 999; }}
   /* GPU card styling */
   .gpu-util {{ color: #bf5af2; }}
   .gpu-temp {{ font-size: 1.3em; font-weight: 600; }}
@@ -842,7 +890,8 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
 
   <button class="debug-toggle" id="debugBtn" title="Toggle debug logging" onclick="toggleDebug()">&#x1F41B;</button>
 
-  <button class="update-btn" id="updateBtn" title="Update from GitHub" onclick="updateServer()" data-state="idle">&#x1F504;</button>
+  <button class="info-btn" id="infoBtn" title="Show model info (free, no inference)" onclick="showModelInfo()">&#x1F4CB;</button>
+  <button class="update-btn" id="updateBtn" title="Update from GitHub" onclick="updateServer()">&#x1F504;</button>
 
   <script>
     // Toggle debug logging on/off
@@ -852,6 +901,60 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
       fetch('/debug/toggle?enable=' + (isOn ? '0' : '1'))
         .then(() => {{ location.reload(); }})
         .catch(() => {{}});
+    }}
+
+    // Show model info popup
+    function showModelInfo() {{
+      const btn = document.getElementById('infoBtn');
+      btn.disabled = true;
+      btn.innerHTML = '&#x23F3;';
+      
+      // Create overlay and popup
+      const overlay = document.createElement('div');
+      overlay.className = 'info-overlay';
+      overlay.onclick = closeInfoPopup;
+      document.body.appendChild(overlay);
+      
+      const popup = document.createElement('div');
+      popup.className = 'info-popup';
+      popup.innerHTML = '<button class="close-btn" onclick="closeInfoPopup()">&times;</button><h3>📋 LM Studio Model Info</h3><div id="infoContent">Loading...</div>';
+      document.body.appendChild(popup);
+      
+      fetch('/api/lm_info')
+        .then(response => response.json())
+        .then(data => {{
+          const content = document.getElementById('infoContent');
+          if (data.error) {{
+            content.innerHTML = `<div class="info-row"><span class="info-label">Status</span><span class="info-value" style="color: #ff3b30;">❌ ${data.error}</span></div>`;
+          }} else {{
+            let html = '';
+            if (data.name) html += `<div class="info-row"><span class="info-label">Model</span><span class="info-value">${data.name}</span></div>`;
+            if (data.context_length && data.context_length !== 'Unknown') {{
+              const ctxNum = parseInt(data.context_length);
+              const ctxPercent = data.context_length !== 'Unknown' ? ((128000 / ctxNum) * 100).toFixed(1) : '—';
+              html += `<div class="info-row"><span class="info-label">Max Context</span><span class="info-value">${data.context_length} tokens (${ctxPercent}% of 128k)</span></div>`;
+            }}
+            if (data.object) html += `<div class="info-row"><span class="info-label">Type</span><span class="info-value">${data.object}</span></div>`;
+            if (data.online) html += `<div class="info-row"><span class="info-label">Status</span><span class="info-value" style="color: #34c759;">✅ Online</span></div>`;
+            if (!data.online) html += `<div class="info-row"><span class="info-label">Status</span><span class="info-value" style="color: #ff3b30;">❌ Offline</span></div>`;
+            content.innerHTML = html;
+          }}
+          btn.innerHTML = '&#x1F4CB;';
+          btn.disabled = false;
+        }})
+        .catch(error => {{
+          const content = document.getElementById('infoContent');
+          content.innerHTML = `<div class="info-row"><span class="info-label">Error</span><span class="info-value" style="color: #ff3b30;">❌ ${error.message}</span></div>`;
+          btn.innerHTML = '&#x1F4CB;';
+          btn.disabled = false;
+        }});
+    }}
+    
+    function closeInfoPopup() {{
+      const overlay = document.querySelector('.info-overlay');
+      const popup = document.querySelector('.info-popup');
+      if (overlay) overlay.remove();
+      if (popup) popup.remove();
     }}
 
     // Update from GitHub
@@ -1134,6 +1237,14 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
         
+        elif self.path == "/api/lm_info":
+            # On-demand: fetch LM Studio model metadata (free, no inference)
+            info = get_lm_studio_info()
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(info, indent=2).encode())
+
         elif self.path == "/api/health":
             # Health check endpoint
             is_valid = _validate_script()
