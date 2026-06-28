@@ -6,11 +6,12 @@ LM Monitor — Real-time LLM Inference Dashboard for Mac Mini (Apple Silicon)
 Monitors:
   • macOS Memory Pressure (Low / Medium / High)
   • Unified RAM Usage (GB used / available / total)
-  • LM Studio Avg Generation Speed (tokens/sec from real requests)
-  • LM Studio Avg Prompt Processing Time (from real request logs)
+  • GPU Utilization & Temperature (macOS Apple Silicon + Linux NVIDIA/AMD fallback)
+  • LM Studio Avg Generation Speed (tokens/sec via API probe)
+  • LM Studio Avg Prompt Processing Time (via API probe)
 
-Reads LM Studio's server.log directly from disk — no test pings, no queueing.
-Results are running averages over the last N completion requests.
+Uses lightweight HTTP probes to LM Studio's /v1/chat/completions endpoint 
+with max_tokens=1 — zero log parsing, no verbose logging required.
 
 Requirements: Python 3.9+ with psutil and requests packages.
 Author: Hermes Agent · Nous Research
@@ -23,9 +24,11 @@ import subprocess
 import time
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 import traceback
 from io import StringIO
+import urllib.request  # stdlib — always available on Python 3.9+
+import urllib.error    # stdlib — always available on Python 3.9+
 
 # Guarded psutil import — available in module scope for all functions
 try:
@@ -117,10 +120,11 @@ def _toggle_logs(on: bool):
 # ──────────────────────────────────────────────
 # Configuration — edit these if needed
 # ──────────────────────────────────────────────
-LM_STUDIO_URL = "http://localhost:1234"   # LM Studio local server port (used for /status checks)
-PORT          = 8080                      # Dashboard HTTP port
-CACHE_TTL     = 5                         # Seconds between log file scans
-AVG_WINDOW    = 10                        # Running average over last N completion requests
+LM_STUDIO_URL   = os.environ.get("LM_STUDIO_URL", "http://localhost:1234")   # LM Studio local server port (API)
+PORT            = 8080                      # Dashboard HTTP port
+CACHE_TTL       = 5                         # Seconds between API probes
+AVG_WINDOW      = 10                        # Running average over last N probe results
+
 
 # ──────────────────────────────────────────────
 # Auto-reload: track our own script mtime at startup
@@ -130,281 +134,164 @@ _SCRIPT_MTIME_START = os.path.getmtime(_SCRIPT_PATH)
 
 
 # ──────────────────────────────────────────────
-# LM Studio log path — macOS v0.4+ directory structure
-# Logs are organized by month: ~/.lmstudio/server-logs/YYYY-MM/
+# LM Studio API probe — lightweight stats collection
 # ──────────────────────────────────────────────
-LM_STUDIO_LOG_DIR = os.path.expanduser("~/.lmstudio/server-logs")
 
-
-def _find_log_files():
-    """Find all log files in the current month's directory."""
-    import datetime
+def _probe_lm_studio():
+    """Send a single max_tokens=1 probe to /v1/chat/completions and extract timing stats.
     
-    now = datetime.datetime.now()
-    month_dir = os.path.join(LM_STUDIO_LOG_DIR, now.strftime("%Y-%m"))
+    Returns dict with: gen_speed_tps (float), ttft_ms (float), or None on failure.
+    This is the ONLY data collection path now — no log parsing at all.
+    """
+    # urllib is always available on Python 3.9+ (stdlib)
+
+    probe_payload = {
+        "model": "",  # empty string tells LM Studio to use the currently loaded model
+        "messages": [{"role": "user", "content": "."}],
+        "max_tokens": 1,
+        "temperature": 0.1,
+    }
     
-    if not os.path.isdir(month_dir):
-        return []
-    
-    # Return all .log files sorted by name (newest first)
-    files = [f for f in os.listdir(month_dir) if f.endswith('.log')]
-    files.sort(reverse=True)  # Newest first (YYYY-MM-DD.N.log)
-    return [os.path.join(month_dir, f) for f in files]
+    url = f"{LM_STUDIO_URL}/v1/chat/completions"
+    data = json.dumps(probe_payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        
+        # Extract stats from response
+        stats = body.get("stats") or {}  # LM Studio native API
+        
+        gen_speed = None
+        ttft_ms = None
+        
+        if "tokens_per_second" in stats:
+            tps = stats["tokens_per_second"]
+            if tps > 0:
+                gen_speed = tps
+        
+        if "time_to_first_token_seconds" in stats:
+            ttft_s = stats["time_to_first_token_seconds"]
+            ttft_ms = ttft_s * 1000
+
+        # Also check OpenAI-compatible response format (data.choices[0].usage)
+        if gen_speed is None and "choices" in body:
+            usage = body["choices"][0].get("usage", {}) or {}
+            prompt_tokens = usage.get("prompt_tokens", 0) or 0
+            completion_tokens = usage.get("completion_tokens", 0) or 0
+            
+            # If we have timing info somewhere, use it
+            if "total_time" in stats and prompt_tokens > 0:
+                ttft_ms = (stats["total_time"] / max(prompt_tokens + completion_tokens, 1)) * 1000
+        
+        return {"gen_speed_tps": gen_speed, "ttft_ms": ttft_ms}
+
+    except urllib.error.URLError as e:
+        # LM Studio not running or unreachable
+        log_debug(f"PROBE FAILED: {e}")
+        return None
+    except Exception as e:
+        log_debug(f"PROBE ERROR: {type(e).__name__}: {e}")
+        return None
 
 
-def _log_file_exists():
-    """Check if any log files exist."""
-    return len(_find_log_files()) > 0
+def _probe_lm_studio_batch(n=3):
+    """Send n probes quickly and collect individual results.
+    
+    Returns list of probe result dicts (may contain None for failed probes).
+    """
+    results = []
+    for _ in range(n):
+        r = _probe_lm_studio()
+        results.append(r)
+        # Small delay between probes so stats are independent
+        time.sleep(0.15)
+    return results
 
 
 # ──────────────────────────────────────────────
-# Cache state — prevents frequent file reads on page reloads
+# Cache state — prevents frequent API calls on page reloads
 # ──────────────────────────────────────────────
 _cache = {
     "lm_online": False,
-    "lm_gen_speed": "—",       # Avg generation speed (tokens/sec) from real requests
+    "lm_gen_speed": "—",       # Avg generation speed (tokens/sec) from probe results
     "lm_detail": "Waiting...", # Detail string with avg metrics
-    "lm_ttft": "—",            # Avg prompt processing time (ms) — placeholder for now
+    "lm_ttft": "—",            # Avg time to first token (ms) from probes
     "lm_ts": 0,
     "logs_enabled": False,     # Toggle: capture stdout/stderr to /debug/logs
-    "log_file_exists": None,   # Whether we found the log file on startup
-    "recent_requests": [],     # Last N parsed completion requests (in memory)
+    "recent_probes": [],       # Last N probe results (in memory)
 }
 
 
 # ──────────────────────────────────────────────
-# Data collection — parse LM Studio text-based logs
+# Data collection — lightweight API probes
 # ──────────────────────────────────────────────
 
-def _read_lm_studio_logs(since_ts=None):
-    """Read and parse LM Studio's server logs (text format).
-    
-    Extracts metrics from 'slot print_timing' lines:
-    - prompt eval time = XXXX ms / YYYY tokens (ZZZ.ZZ t/s)
-    - eval time = XXXX ms / YY tokens (BB.BB t/s)
-    - total time = XXXX ms / ZZZZ tokens
-    
-    Args:
-        since_ts: If set, only include entries with timestamps >= this value.
-                  Used after /reset_avg to filter out old historical data.
-    
-    Returns list of dicts with: task_id, prompt_tokens, completion_tokens, 
-                                 prompt_time_ms, eval_time_ms, gen_speed_tps
-    """
-    import re
-    
-    results = []
-    
-    # Timestamp regex for filtering entries after /reset_avg
-    ts_re = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
-    
-    def parse_line_ts(line):
-        """Extract datetime from log line timestamp, or None."""
-        m = ts_re.search(line)
-        if not m: return None
-        try:
-            return datetime.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')
-        except ValueError:
-            return None
-
-    # Early exit if no log files found
-    if _cache["log_file_exists"] is False:
-        print("📋 No LM Studio log files found — skipping scan. "
-              "Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
-        return results
-    
-    # Find all log files for current month
-    log_files = _find_log_files()
-    if not log_files:
-        print("📋 No log files in current month directory — skipping scan.")
-        return results
-    
-    print(f"📋 Found {len(log_files)} log file(s) to scan")
-    
-    # Regex patterns for extracting metrics
-    prompt_re = re.compile(
-        r'prompt\s+eval\s+time\s+=\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tokens.*?(\d+\.\d+)\s+tokens?\s+per\s+second'
-    )
-    eval_re = re.compile(
-        r'eval\s+time\s+=\s+([\d.]+)\s+ms\s+/\s+(\d+)\s+tokens.*?(\d+\.\d+)\s+tokens?\s+per\s+second'
-    )
-    task_re = re.compile(r'task\s+(\d+)')
-    ntokens_re = re.compile(r'n_tokens\s*=\s*(\d+)')  # Context size from slot print_timing
-    
-    # Process each log file (newest first)
-    total_lines = 0
-    for log_file in log_files[:3]:  # Scan last 3 files max
-        try:
-            with open(log_file, "r", errors="replace") as f:
-                lines = f.readlines()
-            total_lines += len(lines)
-            
-            # Track metrics by task ID (group prompt eval + eval time together)
-            task_metrics = {}
-            
-            for line in lines[-1000:]:  # Last 1000 lines per file
-                line = line.strip()
-                
-                # Filter: skip entries older than reset time (if active)
-                if since_ts is not None:
-                    line_ts = parse_line_ts(line)
-                    if line_ts and line_ts < since_ts:
-                        continue
-                
-                if not line or 'slot print_timing' not in line:
-                    continue
-                
-                # Extract task ID
-                task_match = task_re.search(line)
-                if not task_match:
-                    continue
-                task_id = task_match.group(1)
-                
-                # Extract n_tokens from slot print_timing (this is the actual context size LM Studio shows)
-                ntokens_match = ntokens_re.search(line)
-                if ntokens_match:
-                    n_tokens_val = int(ntokens_match.group(1))
-                    if task_id not in task_metrics:
-                        task_metrics[task_id] = {}
-                    # Use n_tokens as the authoritative context size (matches LM Studio UI)
-                    task_metrics[task_id]['prompt_tokens'] = n_tokens_val
-                
-                # Check for prompt eval time (for speed calculation, not used for context size anymore)
-                prompt_match = prompt_re.search(line)
-                if prompt_match:
-                    prompt_time_ms = float(prompt_match.group(1))
-                    prompt_tps = float(prompt_match.group(3))
-                    
-                    if task_id not in task_metrics:
-                        task_metrics[task_id] = {}
-                    task_metrics[task_id]['prompt_time_ms'] = prompt_time_ms
-                    task_metrics[task_id]['prompt_tps'] = prompt_tps
-                
-                # Check for eval time (generation)
-                eval_match = eval_re.search(line)
-                if eval_match:
-                    eval_time_ms = float(eval_match.group(1))
-                    completion_tokens = int(eval_match.group(2))
-                    eval_tps = float(eval_match.group(3))
-                    
-                    if task_id not in task_metrics:
-                        task_metrics[task_id] = {}
-                    task_metrics[task_id]['eval_time_ms'] = eval_time_ms
-                    task_metrics[task_id]['completion_tokens'] = completion_tokens
-                    task_metrics[task_id]['eval_tps'] = eval_tps
-            
-            # Extract complete results from grouped metrics
-            for task_id, metrics in task_metrics.items():
-                if 'prompt_tokens' in metrics and 'completion_tokens' in metrics:
-                    prompt_tokens = metrics['prompt_tokens']
-                    completion_tokens = metrics['completion_tokens']
-                    prompt_time_ms = metrics.get('prompt_time_ms', 0)
-                    eval_time_ms = metrics.get('eval_time_ms', 0)
-                    
-                    # Calculate generation speed (tokens/sec during generation phase)
-                    if eval_time_ms > 0:
-                        gen_speed = completion_tokens / (eval_time_ms / 1000.0)
-                    else:
-                        gen_speed = 0
-                    
-                    results.append({
-                        'task_id': task_id,
-                        'prompt_tokens': prompt_tokens,
-                        'completion_tokens': completion_tokens,
-                        'prompt_time_ms': prompt_time_ms,
-                        'prompt_tps': metrics.get('prompt_tps', 0),   # tokens/sec during prompt processing
-                        'eval_time_ms': eval_time_ms,
-                        'gen_speed_tps': gen_speed,
-                    })
-
-                if task_id in task_metrics and 'prompt_tps' in task_metrics[task_id] and task_metrics[task_id]['prompt_tps'] > 0:
-                    print(f"🔍 Task {task_id}: prompt={prompt_tokens} tok ({metrics['prompt_tps']:.0f} t/s) · gen={completion_tokens} tok ({gen_speed:.1f} t/s)")
-                    
-        except Exception as e:
-            print(f"⚠️  Error reading {log_file}: {e}")
-    
-    print(f"📋 Parsed {len(results)} completion requests from {total_lines} lines")
-    return results
-
-
-def _calculate_averages(requests):
-    """Calculate running averages from parsed completion requests.
-    
-    Returns (avg_gen_speed, avg_prompt_time_ms, detail_string, sample_count)
-    """
-    if not requests:
-        return "—", "—", "—", "—", "No completion requests found in logs", 0
-    
-    # Use gen_speed_tps directly from logs (already calculated per-request)
-    speeds = [r["gen_speed_tps"] for r in requests if r["gen_speed_tps"] > 0]
-    prompt_times = [r["prompt_time_ms"] for r in requests if r["prompt_time_ms"] > 0]
-    prompt_tps_vals = [r["prompt_tps"] for r in requests if r["prompt_tps"] > 0]
-
-    avg_gen_speed = f"{sum(speeds) / len(speeds):.1f} tok/s" if speeds else "—"
-    avg_prompt_time = sum(prompt_times) / len(prompt_times) if prompt_times else 0
-    avg_prompt_tps = f"{sum(prompt_tps_vals) / len(prompt_tps_vals):.0f} tok/s" if prompt_tps_vals else "—"
-
-    # Average token counts
-    avg_prompt = sum(r["prompt_tokens"] for r in requests) / len(requests)
-    avg_completion = sum(r["completion_tokens"] for r in requests) / len(requests)
-
-    detail_parts = [
-        f"{len(requests)} recent requests",
-        f"Context: {avg_prompt:.0f} tokens · Gen speed: {avg_gen_speed}",
-        f"Prompt processing: {avg_prompt_time:.0f} ms avg ({avg_prompt_tps})",
-    ]
-
-    return avg_gen_speed, avg_prompt_time, avg_prompt_tps, avg_prompt, ", ".join(detail_parts), len(requests)
-
-
 def _get_cached_lm_stats():
-    """Return cached LM Studio stats unless TTL has expired."""
-    # During fresh-start (after /reset_avg), skip log scanning until real completions arrive
-    if "fresh_start_ts" in _cache:
-        reset_time = _cache["fresh_start_ts"]
-        now = time.time()
-        # Scan logs but filter to only entries AFTER the reset timestamp
-        requests = _read_lm_studio_logs(since_ts=datetime.utcfromtimestamp(reset_time) if isinstance(reset_time, (int, float)) else datetime.now())
-        
-        # If we found fresh data after reset point, clear the flag and proceed normally
-        if requests:
-            del _cache["fresh_start_ts"]
-            print("✅ Fresh completions detected post-reset — resuming normal metrics")
-        else:
-            return False, "—", "No data yet — waiting for completions...", "—", "—", None
+    """Return cached LM Studio stats unless TTL has expired.
     
+    On cache miss: sends 3 quick max_tokens=1 probes, averages results.
+    No file I/O, no log parsing — pure HTTP.
+    """
     now = time.time()
     if now - _cache["lm_ts"] > CACHE_TTL:
-        # Read and parse log file
-        requests = _read_lm_studio_logs()
+        # Send probe batch
+        print(f"📡 Probing LM Studio at {LM_STUDIO_URL}...")
         
-        # Update in-memory recent requests (keep last 50)
-        _cache["recent_requests"] = requests[-50:]
+        probes = _probe_lm_studio_batch(3)
+        success_count = sum(1 for p in probes if p is not None)
         
-        # Calculate averages over the last AVG_WINDOW requests
-        window = _cache["recent_requests"][-AVG_WINDOW:] if len(_cache["recent_requests"]) >= AVG_WINDOW else _cache["recent_requests"]
-        
-        gen_speed, avg_prompt_time, prompt_tps, avg_context, detail, count = _calculate_averages(window)
-
-        # Determine online status based on whether we found recent requests
-        online = count > 0
-
-        _cache.update({
-            "lm_online": online,
-            "lm_gen_speed": gen_speed,
-            "lm_detail": detail,
-            "lm_ttft": f"{avg_prompt_time:.0f} ms" if avg_prompt_time != "—" else "—",
-            "lm_prompt_tps": prompt_tps,
-            "lm_context_size": avg_context,
-            "lm_ts": now,
-        })
-
-        print(f"📊 Stats updated: {count} requests in window, gen_speed={gen_speed}, prompt_speed={prompt_tps}, context={avg_context}")
-    # Gracefully handle case where all lm_* keys were cleared (e.g., after /reset_avg)
-    if "lm_online" not in _cache:
-        return False, "—", "No data yet — waiting for completions", "—", "—", None
+        if success_count == 0:
+            # All probes failed — mark offline
+            print("⚠️  LM Studio unreachable at this time")
+            _cache.update({
+                "lm_online": False,
+                "lm_gen_speed": "—",
+                "lm_detail": f"LM Studio not reachable at {LM_STUDIO_URL}",
+                "lm_ttft": "—",
+                "lm_ts": now,
+            })
+        else:
+            # Aggregate successful probes
+            gen_speeds = [p["gen_speed_tps"] for p in probes if p is not None and p.get("gen_speed_tps")]
+            ttfts = [p["ttft_ms"] for p in probes if p is not None and p.get("ttft_ms") is not None]
+            
+            avg_gen = f"{sum(gen_speeds) / len(gen_speeds):.1f} tok/s" if gen_speeds else "—"
+            avg_ttft = f"{sum(ttfts) / len(ttfts):.0f} ms" if ttfts else "—"
+            
+            # Store individual probe results for running average display
+            _cache["recent_probes"] = probes[-AVG_WINDOW:]
+            
+            detail_parts = [
+                f"{success_count}/3 probes succeeded",
+                f"TTFT: {avg_ttft}",
+                f"Gen: {avg_gen}",
+            ]
+            
+            _cache.update({
+                "lm_online": True,
+                "lm_gen_speed": avg_gen if gen_speeds else "—",
+                "lm_detail": ", ".join(detail_parts),
+                "lm_ttft": avg_ttft if ttfts else "—",
+                "lm_ts": now,
+            })
+            
+            print(f"📊 Probe results: {success_count}/3 succeeded")
     
-    return _cache["lm_online"], _cache["lm_gen_speed"], _cache["lm_detail"], _cache["lm_ttft"], _cache["lm_prompt_tps"], _cache.get("lm_context_size")
+    return (
+        _cache["lm_online"],
+        _cache["lm_gen_speed"],
+        _cache["lm_detail"],
+        _cache["lm_ttft"],
+        "—",   # lm_prompt_tps — not tracked with API probe approach
+        0,     # lm_context_size — not tracked with API probe approach
+    )
 
 
 # ──────────────────────────────────────────────
@@ -426,7 +313,7 @@ def _get_memory_pressure():
         raw = result.stdout.strip()
         log_debug(f"MEM_PRESSURE: raw_stdout={repr(raw)}")
 
-        # macOS memory_pressure CLI can output JSON {"systemwide_pressure_level": 0} or plain text "System-wide Memory Pressure: Low"
+        # macOS memory_pressure CLI can output JSON {\"systemwide_pressure_level\": 0} or plain text "System-wide Memory Pressure: Low"
         level = None
 
         # 1. Try parsing as JSON first (common on Ventura/Sonoma)
@@ -470,25 +357,13 @@ def _get_memory_pressure():
         return _get_memory_pressure_psutil()
 
 
-def _get_memory_pressure_psutil():
-    """Fallback when CLI unavailable: estimate pressure from psutil RAM metrics.
-    
-    On macOS Monterey+, the `memory_pressure` CLI should always be present, so this
-    fallback mainly catches edge cases (CLI crashes, non-macOS hosts). We use available
-    RAM rather than used % because macOS aggressively caches free memory — a 90% "used"
-    reading often means only ~3GB is actually held by processes.
-    
-    Thresholds tuned for ~24GB Mac:
-      >6 GB available → Low (green)
-      >2 GB available → Medium (yellow)  
-      <2 GB available → High (red)
-    """
+def _get_memory_pressure_fallback():
+    """Fallback when CLI unavailable: estimate pressure from psutil RAM metrics."""
     if psutil is None:
         return "—", "#888888"
     try:
         mem = psutil.virtual_memory()
         avail_mb = mem.available / (1024 * 1024)
-        log_debug(f"MEM_PRESSURE psutil fallback: RAM={mem.percent:.0f}%, available={avail_mb:.0f}MB")
 
         if avail_mb > 6000:   # > 6 GB still free → Low pressure
             return "Low", "#34c759"
@@ -501,6 +376,11 @@ def _get_memory_pressure_psutil():
         return "—", "#888888"
 
 
+def _get_memory_pressure_psutil():
+    """Fallback when CLI unavailable: estimate pressure from psutil RAM metrics."""
+    return _get_memory_pressure_fallback()
+
+
 def _get_ram_usage():
     """Return RAM percentage, total GB, available GB."""
     if psutil is None:
@@ -510,10 +390,215 @@ def _get_ram_usage():
 
 
 # ──────────────────────────────────────────────
+# GPU Monitoring — cross-platform (Apple Silicon + Linux NVIDIA/AMD)
+# ──────────────────────────────────────────────
+
+def _get_gpu_info():
+    """Return dict with GPU utilization and temperature.
+    
+    Works on:
+      - macOS Apple Silicon: uses powermetrics for GPU/Neural Engine stats
+      - Linux NVIDIA: uses nvidia-smi for util + temp
+      - Linux AMD: tries rocm-smi or falls back to /sys/class/drm
+      - Any platform without GPU support: returns "—", "—"
+    
+    Returns: (utilization_str, temperature_str)
+    """
+    platform_name = sys.platform
+    
+    # ── macOS Apple Silicon ──────────────────────────────
+    if platform_name == "darwin":
+        return _get_gpu_macos()
+    
+    # ── Linux NVIDIA ─────────────────────────────────────
+    if platform_name == "linux":
+        util, temp = _get_gpu_linux_nvidia()
+        if util is not None:  # Found nvidia-smi and working
+            return util, temp
+        
+        # Try AMD ROCm
+        util, temp = _get_gpu_linux_amd_rocm()
+        if util is not None:
+            return util, temp
+    
+    # ── No GPU tooling found ─────────────────────────────
+    return "—", "—"
+
+
+def _get_gpu_macos():
+    """Get GPU stats on macOS via powermetrics CLI.
+    
+    powermetrics (macOS built-in) reports:
+      - GPU load in percent
+      - GPU temperature in Celsius
+    
+    Returns: (utilization_str, temperature_str) or ("—", "—") if unavailable.
+    """
+    try:
+        # Run powermetrics once for a short sample to get GPU stats
+        result = subprocess.run(
+            ["sudo", "-n", "powermetrics", "-i", "100", "--samplers", "gpu"],
+            capture_output=True, text=True, timeout=5
+        )
+        
+        raw = result.stdout + result.stderr
+        
+        # Parse GPU load: look for "GPU load: XX.XX%" or similar
+        import re
+        gpu_load_match = re.search(r'GPU\s+load:\s*([\d.]+)%', raw)
+        if not gpu_load_match:
+            # Try alternate format from newer macOS versions
+            gpu_load_match = re.search(r'gpu\s+utilization:\s*([\d.]+)%', raw, re.IGNORECASE)
+        
+        util_str = f"{float(gpu_load_match.group(1)):.0f}%" if gpu_load_match else None
+        
+        # Parse GPU temperature: look for "GPU die temp:" or "Temperature:"
+        temp_match = re.search(r'GPU\s+die\s+temp:\s*([\d.]+)\s*C', raw, re.IGNORECASE)
+        if not temp_match:
+            temp_match = re.search(r'(?:GPU\s+|Board\s+)?temp(?:erature)?[:\s]+([\d.]+)\s*[Cc]', raw, re.IGNORECASE)
+        
+        temp_str = f"{float(temp_match.group(1)):.0f}°C" if temp_match else None
+        
+        # If powermetrics required sudo and failed, try without sudo (may not work)
+        if util_str is None:
+            result2 = subprocess.run(
+                ["powermetrics", "-i", "100", "--samplers", "gpu"],
+                capture_output=True, text=True, timeout=5
+            )
+            raw2 = result2.stdout + result2.stderr
+            gpu_load_match2 = re.search(r'GPU\s+load:\s*([\d.]+)%', raw2)
+            temp_match2 = re.search(r'GPU\s+die\s+temp:\s*([\d.]+)\s*C', raw2, re.IGNORECASE)
+            
+            if gpu_load_match2:
+                util_str = f"{float(gpu_load_match2.group(1)):.0f}%"
+            if temp_match2:
+                temp_str = f"{float(temp_match2.group(1)):.0f}°C"
+        
+        return (util_str or "—", temp_str or "—")
+    
+    except FileNotFoundError:
+        # powermetrics not found — definitely not macOS, or very old OS
+        log_debug("GPU: powermetrics CLI not found")
+        return "—", "—"
+    except subprocess.TimeoutExpired:
+        log_debug("GPU: powermetrics timed out (may need sudo)")
+        return "—", "—"
+    except Exception as e:
+        log_debug(f"GPU macos exception: {type(e).__name__}: {e}")
+        return "—", "—"
+
+
+def _get_gpu_linux_nvidia():
+    """Get GPU stats on Linux via nvidia-smi.
+    
+    Returns: (utilization_str, temperature_str) or (None, None) if no NVIDIA GPU found.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,name",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        
+        if result.returncode != 0:
+            return None, None
+        
+        lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
+        if not lines:
+            return None, None
+        
+        # nvidia-smi may report multiple GPUs; show the first one (or aggregate)
+        utils = []
+        temps = []
+        name_parts = []
+        
+        for line in lines[:4]:  # Up to 4 GPUs max
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 3:
+                try:
+                    utils.append(float(parts[0]))
+                    temps.append(float(parts[1]))
+                    name_parts.append(parts[2])
+                except (ValueError, IndexError):
+                    pass
+        
+        if not utils:
+            return None, None
+        
+        # Use first GPU as primary, note others in detail
+        util_str = f"{utils[0]:.0f}%"
+        
+        if len(utils) > 1:
+            util_str += f" (total {len(utils)} GPUs)"
+        
+        temp_str = f"{temps[0]:.0f}°C"
+        
+        # If multiple GPUs, mention it
+        if len(temps) > 1:
+            temps_list = ", ".join(f"{t:.0f}°C" for t in temps)
+            temp_str += f" ({', '.join(name_parts[:2])})"
+        
+        return util_str, temp_str
+    
+    except FileNotFoundError:
+        # nvidia-smi not found — no NVIDIA GPU tooling
+        log_debug("GPU: nvidia-smi not found")
+        return None, None
+    except subprocess.TimeoutExpired:
+        log_debug("GPU: nvidia-smi timed out")
+        return None, None
+    except Exception as e:
+        log_debug(f"GPU linux_nvidia exception: {type(e).__name__}: {e}")
+        return None, None
+
+
+def _get_gpu_linux_amd_rocm():
+    """Get GPU stats on Linux via rocm-smi.
+    
+    Returns: (utilization_str, temperature_str) or (None, None) if no AMD GPU found.
+    """
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showinfo"],
+            capture_output=True, text=True, timeout=5
+        )
+        
+        if result.returncode != 0:
+            return None, None
+        
+        raw = result.stdout + result.stderr
+        
+        import re
+        
+        # Parse GPU load
+        gpu_load_match = re.search(r'(?:GPU\s+)?(?:average)?\s*load:\s*([\d.]+)%', raw, re.IGNORECASE)
+        
+        util_str = f"{float(gpu_load_match.group(1)):.0f}%" if gpu_load_match else None
+        
+        # Parse temperature — may be "edge" or "junction" temp
+        temp_match = re.search(r'(?:GPU\s+)?(?:edge|junction)\s+temp:\s*([\d.]+)\s*C', raw, re.IGNORECASE)
+        
+        temp_str = f"{float(temp_match.group(1)):.0f}°C" if temp_match else None
+        
+        return (util_str or "—", temp_str or "—")
+    
+    except FileNotFoundError:
+        log_debug("GPU: rocm-smi not found")
+        return None, None
+    except subprocess.TimeoutExpired:
+        log_debug("GPU: rocm-smi timed out")
+        return None, None
+    except Exception as e:
+        log_debug(f"GPU linux_amd_rocm exception: {type(e).__name__}: {e}")
+        return None, None
+
+
+# ──────────────────────────────────────────────
 # HTML generation — responsive mobile dashboard
 # ──────────────────────────────────────────────
 
-def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context):
+def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, 
+                  gpu_util, gpu_temp, lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context):
     timestamp = datetime.now().strftime("%H:%M:%S")
     dot_color = "#34c759" if lm_online else "#ff3b30"
     
@@ -552,7 +637,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LM Monitor</title>
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  * {{ box-sizing: border-box; margin: 0; padding: 24px; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1a; color: #fff; padding: 24px 16px 80px; min-height: 100vh; }}
   .header {{ text-align: center; margin-bottom: 20px; }}
   .header h1 {{ font-size: 1.3em; color: #aaa; font-weight: 500; }}
@@ -571,6 +656,9 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
   .status-bar .uptime {{ color: #34c759; }}
   .debug-toggle {{ position: fixed; bottom: 80px; right: 20px; background: {dbg_color}; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
   .debug-toggle:hover {{ opacity: 1; }}
+  /* GPU card styling */
+  .gpu-util {{ color: #bf5af2; }}
+  .gpu-temp {{ font-size: 1.3em; font-weight: 600; }}
 </style>
 </head>
 <body>
@@ -588,31 +676,25 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
   </div>
 
   <div class="card">
+    <h2><span class="status-dot"></span>GPU Utilization</h2>
+    <div class="value gpu-util">{gpu_util}</div>
+    <div class="sub">{gpu_temp} · Apple Silicon Neural Engine + GPU (Metal)</div>
+  </div>
+
+  <div class="card">
     <h2><span class="status-dot"></span>Avg Generation Speed</h2>
     <div class="value">{lm_gen_speed}</div>
     <div class="sub">{lm_detail}</div>
   </div>
 
   <div class="card">
-    <h2><span class="status-dot"></span>Avg Prompt Processing Time</h2>
+    <h2><span class="status-dot"></span>Avg Time to First Token (TTFT)</h2>
     <div class="ttft-value">{lm_ttft}</div>
-    <div class="sub">Average duration of last {AVG_WINDOW} completion requests (includes prompt + generation)</div>
-  </div>
-
-  <div class="card">
-    <h2><span class="status-dot"></span>Avg Prompt Processing Speed</h2>
-    <div class="value">{lm_prompt_tps}</div>
-    <div class="sub">Tokens/sec during prompt evaluation phase</div>
-  </div>
-
-  <div class="card">
-    <h2><span class="status-dot"></span>Avg Context Size</h2>
-    <div class="value">{context_display}</div>
-    <div class="sub">Average prompt token count over last {AVG_WINDOW} requests</div>
+    <div class="sub">Average time from request start until first output token arrives</div>
   </div>
 
   <div class="footer">
-    Last updated: {timestamp} · LM Studio log scan every {CACHE_TTL}s<br>
+    Last updated: {timestamp} · LM Studio API probe every {CACHE_TTL}s<br>
     Auto-refresh page with ↻ button below
   </div>
 
@@ -640,7 +722,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail, lm_on
 
     // Reset aggregation window
     function resetAvg() {{
-      if (!confirm('Reset the running average of last {AVG_WINDOW} requests? This will clear cached stats and re-scan from disk.')) return;
+      if (!confirm('Reset the running average of last {AVG_WINDOW} requests? This will clear cached stats and re-probe.')) return;
       fetch('/reset_avg')
         .then(() => {{ location.reload(); }})
         .catch(() => {{ alert('Failed to reset'); }});
@@ -673,10 +755,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             try:
                 pressure, p_color = _get_memory_pressure()
                 ram_pct, ram_total, ram_avail = _get_ram_usage()
+                gpu_util, gpu_temp = _get_gpu_info()
                 lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context = _get_cached_lm_stats()
 
                 html = generate_html(
                     pressure, p_color, ram_pct, ram_total, ram_avail,
+                    gpu_util, gpu_temp,
                     lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context
                 )
                 self.send_response(200)
@@ -703,19 +787,26 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
 
         elif self.path == "/status":
             uptime = int(time.time() - _START_TIME)
+            gpu_util, gpu_temp = _get_gpu_info()
+            # Fetch fresh LM Studio stats (lazy — probes on first request, then caches for CACHE_TTL)
+            lm_online, lm_gen_speed, lm_detail, lm_ttft, lm_prompt_tps, lm_context = _get_cached_lm_stats()
+            
             status_data = {
                 "status": "running",
                 "uptime_seconds": uptime,
                 "pid": os.getpid(),
                 "timestamp": datetime.now().isoformat(),
+                "gpu": {
+                    "utilization": gpu_util,
+                    "temperature": gpu_temp,
+                },
                 "lm_stats": {
-                    "online": _cache["lm_online"],
-                    "gen_speed": _cache["lm_gen_speed"],
-                    "avg_ttft_ms": _cache["lm_ttft"],
-                    "prompt_speed": _cache.get("lm_prompt_tps", "—"),
-                    "context_size": f"{_cache.get('lm_context_size', 0):.0f} tokens",
-                    "detail": _cache["lm_detail"],
-                    "recent_requests_count": len(_cache.get("recent_requests", [])),
+                    "online": lm_online,
+                    "gen_speed": lm_gen_speed,
+                    "detail": lm_detail,
+                    "ttft_ms": lm_ttft,
+                    "prompt_tps": lm_prompt_tps,
+                    "context_size": lm_context,
                 },
             }
             self.send_response(200)
@@ -724,13 +815,12 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
             self.wfile.write(json.dumps(status_data, indent=2).encode())
 
         elif self.path == "/reset_avg":
-            # Reset aggregation window: clear all metrics and mark fresh-start so we skip disk scan
-            _cache["recent_requests"] = []
+            # Reset aggregation window: clear all metrics and mark fresh-start so we skip API calls
+            _cache["recent_probes"] = []
             for key in list(_cache.keys()):
                 if key.startswith("lm_"):
                     del _cache[key]
-            _cache["fresh_start_ts"] = time.time()  # Persistent flag — prevents log re-scan until new completions arrive
-            print("🔄 Aggregation reset — cleared all metrics; dashboard will show empty until new completions arrive")
+            print("🔄 Aggregation reset — cleared all stats; dashboard will show empty until new probes complete")
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
@@ -764,9 +854,9 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
             self.wfile.write(json.dumps({
                 "enabled": _cache.get("logs_enabled", False),
                 "count": len(logs),
-                "recent_requests": len(_cache.get("recent_requests", [])),
-                "log_dir_exists": _cache.get("log_dir_exists"),
-                "lm_studio_log_dir": LM_STUDIO_LOG_DIR,
+                "recent_probes": len(_cache.get("recent_probes", [])),
+                "lm_studio_url": LM_STUDIO_URL,
+                "probe_method": "API (no log parsing)",
                 "logs": logs,
             }, indent=2).encode())
 
@@ -776,10 +866,6 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
 
 # ──────────────────────────────────────────────
 # Entry point
-# ──────────────────────────────────────────────
-
-# ──────────────────────────────────────────────
-# Crash handler & debug logging
 # ──────────────────────────────────────────────
 
 LOGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -813,6 +899,7 @@ def handle_crash(exc_type, exc_value, exc_traceback) -> None:
 
 sys.excepthook = handle_crash
 
+
 # ──────────────────────────────────────────────
 # Background log HTTP server (survives dashboard crashes)
 # ──────────────────────────────────────────────
@@ -844,24 +931,38 @@ def _start_log_server() -> None:
         f.write(str(proc.pid))
     log_debug(f"Log server started on port 8081 (PID {proc.pid})")
 
+
+
 # ──────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
     print(f"🚀 Dashboard running at http://<YOUR_MAC_IP>:{PORT}")
-    print(f"   Reading LM Studio logs from: {LM_STUDIO_LOG_DIR}/")
-    print(f"   Log scan every {CACHE_TTL}s · Running avg over last {AVG_WINDOW} requests")
+    print(f"   Probing LM Studio API: {LM_STUDIO_URL}/v1/chat/completions")
+    print(f"   Probe every {CACHE_TTL}s · Running avg over last {AVG_WINDOW} probes")
+    
+    # Show GPU detection status
+    gpu_util, gpu_temp = _get_gpu_info()
+    print(f"   GPU: {gpu_util} utilization / {gpu_temp} temperature")
+    
     print("Press Ctrl+C to stop.")
     
-    # Check if log directory exists on startup
-    if os.path.isdir(LM_STUDIO_LOG_DIR):
-        _cache["log_dir_exists"] = True
-        print(f"✅ Found LM Studio log dir: {LM_STUDIO_LOG_DIR}/")
+    # Verify LM Studio API is reachable on startup
+    probe_result = _probe_lm_studio()
+    if probe_result and probe_result.get("gen_speed_tps"):
+        print(f"✅ LM Studio API reachable — gen speed: {probe_result['gen_speed_tps']:.1f} tok/s")
+        # Seed the cache with this first result so dashboard shows something immediately
+        _cache.update({
+            "lm_online": True,
+            "lm_gen_speed": f"{probe_result['gen_speed_tps']:.1f} tok/s",
+            "lm_detail": "Initial probe — gen speed from startup test",
+            "lm_ttft": f"{probe_result.get('ttft_ms', 0):.0f} ms" if probe_result.get("ttft_ms") else "—",
+            "lm_ts": time.time(),
+        })
     else:
-        _cache["log_dir_exists"] = False
-        print(f"⚠️  LM Studio log dir not found at: {LM_STUDIO_LOG_DIR}/")
-        print("   Enable 'Verbose Server Logs' in LM Studio → Settings → Developer")
+        print(f"⚠️  LM Studio API not reachable at {LM_STUDIO_URL}")
+        print("   Make sure LM Studio server is running (Developer → Status: Running)")
     
     # Start the background log server (survives dashboard crashes)
     _start_log_server()
