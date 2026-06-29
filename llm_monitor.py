@@ -1538,26 +1538,15 @@ if __name__ == "__main__":
         else:
             print("❌ No backups available — continuing with broken script")
     
-    # Seed cache with one startup probe (no warning — LM Studio may start later)
-    probe_result = _probe_lm_studio()
-    if probe_result and probe_result.get("gen_speed_tps"):
-        print(f"✅ LM Studio API reachable — gen speed: {probe_result['gen_speed_tps']:.1f} tok/s")
-        _cache.update({
-            "lm_online": True,
-            "lm_gen_speed": f"{probe_result['gen_speed_tps']:.1f} tok/s",
-            "lm_detail": "Initial probe — gen speed from startup test",
-            "lm_ttft": f"{probe_result.get('ttft_ms', 0):.0f} ms" if probe_result.get("ttft_ms") else "—",
-            "lm_ts": time.time(),
-        })
-    else:
-        # Don't warn — LM Studio often starts after the monitor. Just seed cache offline.
-        _cache.update({
-            "lm_online": False,
-            "lm_gen_speed": "—",
-            "lm_detail": f"LM Studio not reachable at {LM_STUDIO_URL} (will re-probe every {CACHE_TTL}s)",
-            "lm_ttft": "—",
-            "lm_ts": time.time(),
-        })
+    # Seed cache with initial status (log parsing will populate on first scan)
+    _cache.update({
+        "lm_online": False,
+        "lm_gen_speed": "—",
+        "lm_detail": f"Waiting for first log scan...",
+        "lm_ttft": "—",
+        "lm_ts": time.time(),
+    })
+    print("✅ Initial cache seeded — waiting for log data")
     
 class ReusableTCPServer(socketserver.TCPServer):
     allow_reuse_address = True
