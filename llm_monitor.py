@@ -1465,7 +1465,10 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
         
         elif self.path == "/api/stop":
             # Stop dashboard and log server gracefully
-            log_debug("Stop endpoint called — shutting down dashboard")
+            log_debug("Stop endpoint called — shutting down dashboard and watchdog")
+            
+            # Stop watchdog thread
+            _stop_watchdog()
             
             # Kill log server
             pid_file = os.path.join(LOGS_DIR, "log_server.pid")
@@ -1487,6 +1490,27 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
             
             # Schedule shutdown after response
             threading.Thread(target=lambda: httpd.shutdown(), daemon=True).start()
+        
+        elif self.path == "/api/watchdog":
+            # Manual watchdog check — returns status dict
+            status = _handle_watchdog_check()
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(status, indent=2).encode())
+        
+        elif self.path == "/api/watchdog/status":
+            # Just return status without checking/restarting
+            stale = _check_stale_pid()
+            alive = _check_log_server_alive()
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "watchdog_active": _watchdog_running,
+                "log_server_alive": alive,
+                "pid_stale": stale,
+            }, indent=2).encode())
         
         elif self.path.startswith("/debug/toggle"):
             # Parse query string: /debug/toggle?enable=1 or /debug/toggle?enable=0
@@ -1703,15 +1727,92 @@ class LogServerHandler(BaseHTTPRequestHandler):
         pass
 
 
+def _check_log_server_alive() -> bool:
+    """Check if log server is responding on port 8081."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        result = sock.connect_ex(("127.0.0.1", 8081))
+        sock.close()
+        if result != 0:
+            return False
+        # Try to actually connect and get a response
+        sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock2.settimeout(2)
+        sock2.connect(("127.0.0.1", 8081))
+        sock2.sendall(b"GET / HTTP/1.0\r\n\r\n")
+        response = sock2.recv(1024)
+        sock2.close()
+        return b"200" in response or b"Log" in response or len(response) > 0
+    except Exception:
+        return False
+
+
+def _check_stale_pid() -> bool:
+    """Check if PID file exists but process is dead."""
+    pid_file = os.path.join(LOGS_DIR, "log_server.pid")
+    if not os.path.exists(pid_file):
+        return False
+    try:
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
+        # Check if process is actually running
+        os.kill(pid, 0)  # Signal 0 checks existence without sending signal
+        return False  # Process is alive
+    except (ValueError, ProcessLookupError, PermissionError):
+        # PID is stale
+        try:
+            os.remove(pid_file)
+            log_debug("Removed stale PID file")
+        except:
+            pass
+        return True
+
+
+def _restart_log_server() -> None:
+    """Kill existing log server and start a new one."""
+    # Kill existing process if any
+    pid_file = os.path.join(LOGS_DIR, "log_server.pid")
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+            log_debug(f"Killed existing log server (PID {pid})")
+            time.sleep(1)  # Wait for clean shutdown
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.remove(pid_file)
+        except:
+            pass
+    
+    # Start fresh
+    _start_log_server()
+    log_debug("Log server restarted")
+
+
+def _log_server_watchdog() -> None:
+    """Watchdog that checks log server health every 30 seconds."""
+    log_debug("Log server watchdog started (checks every 30s)")
+    while True:
+        time.sleep(30)
+        if _check_stale_pid():
+            log_debug("Stale PID detected — restarting log server")
+            _restart_log_server()
+        elif not _check_log_server_alive():
+            log_debug("Log server not responding — restarting")
+            _restart_log_server()
+        else:
+            log_debug("Log server healthy")
+
+
 def _start_log_server() -> None:
     """Start a background HTTP server on port 8081 serving logs with HTML interface."""
     import socket
     
     # Check if already running on port 8081
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    result = sock.connect_ex(("127.0.0.1", 8081))
-    sock.close()
-    if result == 0:
+    if _check_log_server_alive():
         log_debug("Log server already running on port 8081")
         return
     
@@ -1744,6 +1845,57 @@ with ReusableLogServer(("0.0.0.0", 8081), LogServerHandler) as httpd:
     with open(pid_file, "w") as f:
         f.write(str(proc.pid))
     log_debug(f"Log server started on port 8081 (PID {proc.pid})")
+
+
+# ──────────────────────────────────────────────
+# Log server watchdog — background thread
+# ──────────────────────────────────────────────
+
+_watchdog_running = False
+_watchdog_thread = None
+
+
+def _start_watchdog() -> None:
+    """Start the watchdog thread that monitors log server health."""
+    global _watchdog_running, _watchdog_thread
+    if _watchdog_running:
+        log_debug("Watchdog already running")
+        return
+    
+    _watchdog_running = True
+    _watchdog_thread = threading.Thread(target=_log_server_watchdog, daemon=True)
+    _watchdog_thread.start()
+    log_debug("Watchdog thread started")
+
+
+def _stop_watchdog() -> None:
+    """Stop the watchdog thread."""
+    global _watchdog_running
+    _watchdog_running = False
+    log_debug("Watchdog thread stopped")
+
+
+def _handle_watchdog_check() -> dict:
+    """Manual watchdog check — returns status dict."""
+    stale = _check_stale_pid()
+    alive = _check_log_server_alive()
+    
+    status = {
+        "watchdog_active": _watchdog_running,
+        "log_server_alive": alive,
+        "pid_stale": stale,
+        "pid_file": os.path.join(LOGS_DIR, "log_server.pid"),
+        "pid_exists": os.path.exists(os.path.join(LOGS_DIR, "log_server.pid")),
+    }
+    
+    if stale or not alive:
+        log_debug("Manual watchdog check — restarting log server")
+        _restart_log_server()
+        status["action_taken"] = "restarted"
+    else:
+        status["action_taken"] = "none — server healthy"
+    
+    return status
 
 
 
@@ -1794,6 +1946,10 @@ if __name__ == "__main__":
     # Start the background log server (survives dashboard crashes)
     _start_log_server()
     print(f"📂 Log server started on port 8081 — I can read crash/debug logs remotely")
+    
+    # Start the watchdog thread
+    _start_watchdog()
+    print("🐕 Watchdog started — monitors log server health every 30s")
     
     try:
         with ReusableTCPServer(("", PORT), Handler) as httpd:
