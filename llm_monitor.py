@@ -45,6 +45,7 @@ _START_TIME = time.time()
 # ──────────────────────────────────────────────
 # Git version info — resolves commit hash & timestamp
 # ──────────────────────────────────────────────
+_SCRIPT_PATH = os.path.abspath(__file__)
 
 def _get_git_info():
     """Return (short_hash, commit_timestamp) from git log, or ('—', '—') if not a git repo."""
@@ -244,7 +245,6 @@ def _validate_script():
 # ──────────────────────────────────────────────
 # Auto-reload: track our own script mtime at startup
 # ──────────────────────────────────────────────
-_SCRIPT_PATH = os.path.abspath(__file__)
 _SCRIPT_MTIME_START = os.path.getmtime(_SCRIPT_PATH)
 
 
@@ -502,8 +502,8 @@ def _get_cached_lm_stats():
         _cache["lm_gen_speed"],
         _cache["lm_detail"],
         _cache["lm_ttft"],
-        "—",   # lm_prompt_tps — not tracked with API probe approach
-        0,     # lm_context_size — not tracked with API probe approach
+        _cache.get("lm_prompt_tps", "—"),
+        _cache.get("lm_context_size", "—"),
     )
 
 
@@ -1513,6 +1513,11 @@ def _start_log_server() -> None:
 # Entry point
 # ──────────────────────────────────────────────
 
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+    allow_reuse_port = True
+
+
 if __name__ == "__main__":
     print(f"🚀 Dashboard running at http://<YOUR_MAC_IP>:{PORT}")
     print(f"   Probing LM Studio API: {LM_STUDIO_URL}/v1/chat/completions")
@@ -1538,7 +1543,7 @@ if __name__ == "__main__":
         else:
             print("❌ No backups available — continuing with broken script")
     
-    # Seed cache with initial status (log parsing will populate on first scan)
+    # Seed cache with initial status
     _cache.update({
         "lm_online": False,
         "lm_gen_speed": "—",
@@ -1548,23 +1553,6 @@ if __name__ == "__main__":
     })
     print("✅ Initial cache seeded — waiting for log data")
     
-class ReusableTCPServer(socketserver.TCPServer):
-    allow_reuse_address = True
-    allow_reuse_port = True
-
-
-if __name__ == "__main__":
-    # Validate script on startup — auto-rollback if broken
-    if not _validate_script():
-        print("❌ Script validation failed — attempting auto-rollback...")
-        backup_path = _get_latest_backup()
-        if backup_path and _restore_backup(backup_path):
-            print("✅ Rolled back to previous version. Restarting...")
-            os.execv(sys.executable, [sys.executable, __file__])
-        else:
-            print("❌ No backup available to roll back to. Exiting.")
-            sys.exit(1)
-
     # Start the background log server (survives dashboard crashes)
     _start_log_server()
     print(f"📂 Log server started on port 8081 — I can read crash/debug logs remotely")
