@@ -865,6 +865,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   .status-bar {{ display: flex; justify-content: center; align-items: center; gap: 12px; padding: 8px 12px; margin-top: 20px; border-radius: 10px; background: #1e1e1e; border: 1px solid #333; }}
   .status-bar span {{ font-size: 0.75em; color: #888; }}
   .status-bar .commit {{ color: #64d2ff; font-family: 'SF Mono', 'Fira Code', monospace; font-weight: 600; }}
+  .status-bar .commit-ts {{ color: #888; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.85em; }}
   .status-bar .uptime {{ color: #34c759; }}
   .debug-toggle {{ position: fixed; bottom: 80px; right: 20px; background: {dbg_color}; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
   .debug-toggle:hover {{ opacity: 1; }}
@@ -949,6 +950,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
 
   <div class="status-bar">
     <span class="commit">{commit_hash}</span>
+    <span class="commit-ts">{commit_ts}</span>
     <span>·</span>
     <span>{commit_age} ago</span>
     <span>·</span>
