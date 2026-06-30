@@ -399,29 +399,30 @@ def _read_lm_studio_logs(since_ts=None):
                     task_metrics[task_id]['eval_tps'] = eval_tps
             
             for task_id, metrics in task_metrics.items():
-                if 'prompt_tokens' in metrics and 'completion_tokens' in metrics:
-                    prompt_tokens = metrics['prompt_tokens']
-                    completion_tokens = metrics['completion_tokens']
-                    prompt_time_ms = metrics.get('prompt_time_ms', 0)
-                    eval_time_ms = metrics.get('eval_time_ms', 0)
-                    
-                    if eval_time_ms > 0:
-                        gen_speed = completion_tokens / (eval_time_ms / 1000.0)
-                    else:
-                        gen_speed = 0
-                    
+                prompt_tokens = metrics.get('prompt_tokens', 0)
+                completion_tokens = metrics.get('completion_tokens', 0)
+                prompt_time_ms = metrics.get('prompt_time_ms', 0)
+                eval_time_ms = metrics.get('eval_time_ms', 0)
+                prompt_tps = metrics.get('prompt_tps', 0)
+                
+                if eval_time_ms > 0:
+                    gen_speed = completion_tokens / (eval_time_ms / 1000.0)
+                else:
+                    gen_speed = 0
+                
+                if prompt_tokens and completion_tokens:
                     results.append({
                         'task_id': task_id,
                         'prompt_tokens': prompt_tokens,
                         'completion_tokens': completion_tokens,
                         'prompt_time_ms': prompt_time_ms,
-                        'prompt_tps': metrics.get('prompt_tps', 0),
+                        'prompt_tps': prompt_tps,
                         'eval_time_ms': eval_time_ms,
                         'gen_speed_tps': gen_speed,
                     })
-
-                if task_id in task_metrics and 'prompt_tps' in task_metrics[task_id] and task_metrics[task_id]['prompt_tps'] > 0:
-                    print(f"🔍 Task {task_id}: prompt={prompt_tokens} tok ({metrics['prompt_tps']:.0f} t/s) · gen={completion_tokens} tok ({gen_speed:.1f} t/s)")
+                
+                if prompt_tps > 0:
+                    print(f"🔍 Task {task_id}: prompt={prompt_tokens} tok ({prompt_tps:.0f} t/s) · gen={completion_tokens} tok ({gen_speed:.1f} t/s)")
                     
         except Exception as e:
             print(f"⚠️  Error reading {log_file}: {e}")
@@ -1482,9 +1483,145 @@ sys.excepthook = handle_crash
 # Background log HTTP server (survives dashboard crashes)
 # ──────────────────────────────────────────────
 
+def _generate_log_html(filename: str) -> str:
+    """Generate HTML page for viewing a log file."""
+    filepath = os.path.join(LOGS_DIR, filename)
+    if not os.path.exists(filepath):
+        return "<h2>File not found</h2>"
+    
+    with open(filepath, 'r', errors='replace') as f:
+        content = f.read()
+    
+    # Escape HTML
+    content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    
+    # Highlight errors/warnings
+    import re
+    content = re.sub(r'(ERROR|Exception|Traceback)', r'<span class="error">\1</span>', content)
+    content = re.sub(r'(WARNING|WARN)', r'<span class="warning">\1</span>', content)
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{filename} - Log Viewer</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'SF Mono', monospace; margin: 0; padding: 20px; background: #1a1a1a; color: #d4d4d4; }}
+            .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
+            .header h1 {{ margin: 0; font-size: 1.5em; }}
+            .header a {{ color: #4fc3f7; text-decoration: none; }}
+            .header a:hover {{ text-decoration: underline; }}
+            .stats {{ font-size: 0.9em; color: #888; }}
+            #log-content {{ background: #0d0d0d; padding: 15px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; font-size: 13px; }}
+            .error {{ color: #ff6b6b; font-weight: bold; }}
+            .warning {{ color: #ffd93d; }}
+            .timestamp {{ color: #4fc3f7; }}
+            input[type="text"] {{ width: 300px; padding: 8px; background: #2d2d2d; border: 1px solid #444; color: #fff; border-radius: 4px; }}
+            .search-box {{ margin-bottom: 15px; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>📄 {filename}</h1>
+            <div>
+                <a href="/">← Back to logs</a>
+            </div>
+        </div>
+        <div class="stats">
+            {os.path.getsize(filepath)} bytes | Last modified: {os.path.getmtime(filepath):.0f}
+        </div>
+        <div class="search-box">
+            <input type="text" id="search" placeholder="Search logs..." oninput="filterLogs()">
+        </div>
+        <div id="log-content">{content}</div>
+        <script>
+            function filterLogs() {{
+                const search = document.getElementById('search').value.toLowerCase();
+                const lines = document.getElementById('log-content').textContent.split('\\n');
+                const filtered = lines.filter(line => !search || line.toLowerCase().includes(search));
+                document.getElementById('log-content').textContent = filtered.join('\\n');
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+
+def _generate_logs_index_html() -> str:
+    """Generate HTML index page listing all log files."""
+    files_html = []
+    for f in sorted(os.listdir(LOGS_DIR), reverse=True):
+        if f.endswith('.log') and not f.endswith('.pid'):
+            filepath = os.path.join(LOGS_DIR, f)
+            size = os.path.getsize(filepath)
+            size_kb = f"{size / 1024:.1f} KB"
+            mtime = os.path.getmtime(filepath)
+            mtime_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime))
+            files_html.append(f'<li><a href="/logs/{f}">📄 {f}</a> <span class="stats">{size_kb} | {mtime_str}</span></li>')
+    
+    if not files_html:
+        files_html = '<li>No log files found</li>'
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Log Viewer - LM Monitor</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'SF Mono', monospace; margin: 0; padding: 20px; background: #1a1a1a; color: #d4d4d4; }}
+            h1 {{ color: #4fc3f7; }}
+            ul {{ list-style: none; padding: 0; }}
+            li {{ padding: 10px; margin: 5px 0; background: #2d2d2d; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; }}
+            a {{ color: #4fc3f7; text-decoration: none; }}
+            a:hover {{ text-decoration: underline; }}
+            .stats {{ color: #888; font-size: 0.9em; }}
+            .back-link {{ display: inline-block; margin-bottom: 20px; color: #4fc3f7; text-decoration: none; }}
+            .back-link:hover {{ text-decoration: underline; }}
+        </style>
+    </head>
+    <body>
+        <a href="/" class="back-link">← LM Monitor Dashboard</a>
+        <h1>📋 Available Log Files</h1>
+        <ul>
+            {"".join(files_html)}
+        </ul>
+    </body>
+    </html>
+    """
+
+
+class LogServerHandler(BaseHTTPRequestHandler):
+    """Custom HTTP handler for log server."""
+    
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(_generate_logs_index_html().encode())
+        elif self.path.startswith('/logs/'):
+            filename = self.path.split('/logs/')[-1]
+            if filename.endswith('.log'):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write(_generate_log_html(filename).encode())
+            else:
+                self.send_error(404, "Not found")
+        else:
+            self.send_error(404)
+    
+    def log_message(self, format, *args):
+        """Suppress default logging."""
+        pass
+
+
 def _start_log_server() -> None:
-    """Start a background http.server on port 8081 serving the logs/ folder."""
-    import subprocess
+    """Start a background HTTP server on port 8081 serving logs with HTML interface."""
     import socket
     
     # Check if already running on port 8081
@@ -1498,8 +1635,24 @@ def _start_log_server() -> None:
     # Not running — start it detached from the dashboard process
     pid_file = os.path.join(LOGS_DIR, "log_server.pid")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "http.server", "8081"],
-        cwd=LOGS_DIR,
+        [sys.executable, "-c", f"""
+import sys
+sys.path.insert(0, {repr(os.path.dirname(os.path.abspath(__file__)))})
+from http.server import BaseHTTPRequestHandler
+from socketserver import TCPServer
+from llm_monitor import LogServerHandler
+import os
+
+LOGS_DIR = {repr(LOGS_DIR)}
+
+class ReusableLogServer(TCPServer):
+    allow_reuse_address = True
+
+with ReusableLogServer(("0.0.0.0", 8081), LogServerHandler) as httpd:
+    print("Log server running on port 8081", flush=True)
+    httpd.serve_forever()
+""",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
