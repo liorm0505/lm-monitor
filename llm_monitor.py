@@ -964,6 +964,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   <button class="info-btn" id="infoBtn" title="Show model info (free, no inference)" onclick="showModelInfo()">&#x1F4CB;</button>
   <button class="update-btn" id="updateBtn" title="Update from GitHub" onclick="updateServer()">&#x1F504;</button>
   <button class="forward-btn" id="forwardBtn" title="Forward logs for debugging" onclick="forwardLogs()">&#x1F4E4;</button>
+  <button class="stop-btn" id="stopBtn" title="Stop dashboard and log server" onclick="stopServer()">&#x1F6D1;</button>
 
   <script>
     // HTML escape helper
@@ -1096,6 +1097,68 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
           btn.innerHTML = '&#x1F4E4;';
           btn.title = 'Forward logs for debugging';
         }});
+    }}
+
+    // Stop dashboard and log server
+    function stopServer() {{
+      if (confirm('⚠️ Are you sure you want to stop the dashboard and log server?')) {{
+        const btn = document.getElementById('stopBtn');
+        btn.disabled = true;
+        btn.innerHTML = '&#x23F3;';
+        btn.title = 'Stopping...';
+        
+        fetch('/api/stop')
+          .then(response => response.json())
+          .then(data => {{
+            if (data.status === 'stopping') {{
+              btn.innerHTML = '&#x2705;';
+              btn.title = 'Stopped!';
+              setTimeout(() => {{
+                alert('✅ Dashboard and log server stopped successfully');
+                location.reload();
+              }}, 500);
+            }}
+          }})
+          .catch(error => {{
+            btn.innerHTML = '&#x274C;';
+            btn.title = 'Stop failed: ' + error.message;
+            setTimeout(() => {{
+              btn.innerHTML = '&#x1F6D1;';
+              btn.disabled = false;
+            }}, 2000);
+          }});
+      }}
+    }}
+
+    // Stop dashboard and log server
+    function stopServer() {{
+      if (confirm('⚠️ Are you sure you want to stop the dashboard and log server?')) {{
+        const btn = document.getElementById('stopBtn');
+        btn.disabled = true;
+        btn.innerHTML = '&#x23F3;';
+        btn.title = 'Stopping...';
+        
+        fetch('/api/stop')
+          .then(response => response.json())
+          .then(data => {{
+            if (data.status === 'stopping') {{
+              btn.innerHTML = '&#x2705;';
+              btn.title = 'Stopped!';
+              setTimeout(() => {{
+                alert('✅ Dashboard and log server stopped successfully');
+                location.reload();
+              }}, 500);
+            }}
+          }})
+          .catch(error => {{
+            btn.innerHTML = '&#x274C;';
+            btn.title = 'Stop failed: ' + error.message;
+            setTimeout(() => {{
+              btn.innerHTML = '&#x1F6D1;';
+              btn.disabled = false;
+            }}, 2000);
+          }});
+      }}
     }}
 
     // Reset aggregation window
@@ -1385,26 +1448,46 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
                 self.send_header("Content-type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": "No log files found"}).encode())
-            else:
-                # Read last 100 lines from newest log file
-                newest = log_files[0]
+                return
+            
+            newest = max(log_files, key=os.path.getmtime)
+            with open(newest, "r", errors="replace") as f:
+                lines = f.readlines()[-100:]
+            
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "ok",
+                "file": os.path.basename(newest),
+                "content": "".join(lines)
+            }).encode())
+        
+        elif self.path == "/api/stop":
+            # Stop dashboard and log server gracefully
+            log_debug("Stop endpoint called — shutting down dashboard")
+            
+            # Kill log server
+            pid_file = os.path.join(LOGS_DIR, "log_server.pid")
+            if os.path.exists(pid_file):
                 try:
-                    with open(newest, "r", errors="replace") as f:
-                        lines = f.readlines()[-100:]
-                    self.send_response(200)
-                    self.send_header("Content-type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({
-                        "file": newest,
-                        "lines": len(lines),
-                        "content": "".join(lines)
-                    }).encode())
-                except Exception as e:
-                    self.send_response(500)
-                    self.send_header("Content-type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": str(e)}).encode())
-
+                    with open(pid_file, "r") as f:
+                        pid = int(f.read().strip())
+                    os.kill(pid, signal.SIGTERM)
+                    log_debug(f"Log server (PID {pid}) terminated")
+                except (ValueError, ProcessLookupError, PermissionError):
+                    pass
+                os.remove(pid_file)
+            
+            # Shutdown the server
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "stopping"}).encode())
+            
+            # Schedule shutdown after response
+            threading.Thread(target=lambda: httpd.shutdown(), daemon=True).start()
+        
         elif self.path.startswith("/debug/toggle"):
             # Parse query string: /debug/toggle?enable=1 or /debug/toggle?enable=0
             params = self.path.split("?")[1] if "?" in self.path else ""
