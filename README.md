@@ -2,7 +2,7 @@
 
 Lightweight Python HTTP dashboard for monitoring macOS Memory Pressure, RAM usage, and LM Studio inference speed (tokens/sec + total latency) remotely via iPhone.
 
-## Quick Install on Mac Mini M4 Pro
+## Quick Install on Host Machine (Mac Mini M4 Pro)
 
 ### 1. Clone the repo
 
