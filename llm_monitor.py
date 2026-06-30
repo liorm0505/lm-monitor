@@ -17,6 +17,7 @@ Author: Hermes Agent · Nous Research
 """
 
 import http.server
+from http.server import BaseHTTPRequestHandler
 import socketserver
 import json
 import subprocess
