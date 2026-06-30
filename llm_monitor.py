@@ -24,6 +24,7 @@ import subprocess
 import time
 import os
 import sys
+import signal
 import threading
 from datetime import datetime, timezone
 import traceback
