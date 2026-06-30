@@ -15,3 +15,5 @@ __pycache__/
 
 # Runtime logs (written by the script, read remotely)
 logs/
+start-all.command
+stop-all.command
