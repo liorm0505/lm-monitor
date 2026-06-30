@@ -258,18 +258,38 @@ LM_STUDIO_LOG_DIR = os.path.expanduser("~/.lmstudio/server-logs")
 
 
 def _find_log_files():
-    """Find all log files in the current month's directory."""
+    """Find all log files in the current date's directory (YYYY-MM-DD format)."""
     import datetime
     
     now = datetime.datetime.now()
+    
+    # Try date-based directory first (YYYY-MM-DD)
+    date_dir = os.path.join(LM_STUDIO_LOG_DIR, now.strftime("%Y-%m-%d"))
+    if os.path.isdir(date_dir):
+        files = [f for f in os.listdir(date_dir) if f.endswith('.log')]
+        files.sort(reverse=True)  # Newest first
+        return [os.path.join(date_dir, f) for f in files]
+    
+    # Fallback to month-based directory (YYYY-MM)
     month_dir = os.path.join(LM_STUDIO_LOG_DIR, now.strftime("%Y-%m"))
+    if os.path.isdir(month_dir):
+        files = [f for f in os.listdir(month_dir) if f.endswith('.log')]
+        files.sort(reverse=True)  # Newest first
+        return [os.path.join(month_dir, f) for f in files]
     
-    if not os.path.isdir(month_dir):
-        return []
+    # Fallback: search all subdirectories for log files
+    if os.path.isdir(LM_STUDIO_LOG_DIR):
+        all_files = []
+        for subdir in os.listdir(LM_STUDIO_LOG_DIR):
+            subdir_path = os.path.join(LM_STUDIO_LOG_DIR, subdir)
+            if os.path.isdir(subdir_path):
+                for f in os.listdir(subdir_path):
+                    if f.endswith('.log'):
+                        all_files.append(os.path.join(subdir_path, f))
+        all_files.sort(reverse=True)
+        return all_files
     
-    files = [f for f in os.listdir(month_dir) if f.endswith('.log')]
-    files.sort(reverse=True)  # Newest first
-    return [os.path.join(month_dir, f) for f in files]
+    return []
 
 
 def _log_file_exists():
