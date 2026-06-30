@@ -916,18 +916,18 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
     .status-dot {{ width: 8px; height: 8px; margin-right: 4px; }}
     
     /* Stack floating buttons vertically on left side, away from content */
-    .refresh-btn, .update-btn, .forward-btn, .info-btn, .debug-toggle, .capture-btn {
+    .refresh-btn, .update-btn, .forward-btn, .info-btn, .debug-toggle, .capture-btn {{
       right: auto;
       left: 10px;
       bottom: auto;
-    }
-    .refresh-btn { bottom: 10px; }
-    .debug-toggle { bottom: 70px; }
-    .update-btn { bottom: 130px; }
-    .info-btn { bottom: 190px; }
-    .forward-btn { bottom: 250px; }
-    .capture-btn { bottom: 310px; }
-  }
+    }}
+    .refresh-btn {{ bottom: 10px; }}
+    .debug-toggle {{ bottom: 70px; }}
+    .update-btn {{ bottom: 130px; }}
+    .info-btn {{ bottom: 190px; }}
+    .forward-btn {{ bottom: 250px; }}
+    .capture-btn {{ bottom: 310px; }}
+  }}
   
   /* Small mobile (iPhone SE, etc.) */
   @media (max-width: 375px) {{
@@ -1204,7 +1204,7 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
 
   <button class="refresh-btn" onclick="location.reload()">↻</button>
 </body>
-</html>"""
+</html>}}"""
 
 
 # ──────────────────────────────────────────────
@@ -1250,7 +1250,7 @@ body{{max-width:600px;margin:auto;padding-top:40px}}h1{{font-size:1.5em;margin-b
 .sub{{color:#aaa;margin-top:16px}}</style></head><body>
 <h1>⚠️ Dashboard Error</h1><pre>{traceback.format_exc()}</pre>
 <div class="sub">Check ~/llm-monitor/logs/crash.log for details. Server process is alive (status endpoint works).</div>
-</body></html>"""
+</body></html>}}"""
                     self.send_response(500)
                     self.send_header("Content-type", "text/html")
                     self.end_headers()
