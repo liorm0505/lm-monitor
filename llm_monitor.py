@@ -903,16 +903,43 @@ def generate_html(pressure, pressure_color, ram_pct, ram_total, ram_avail,
   .header h1 {{ font-size: 1.2em; margin-bottom: 16px; }}
   .footer {{ margin-top: 20px; font-size: 0.7em; }}
   /* Mobile responsive */
-  @media (max-width: 600px) {{
-    body {{ padding: 12px 10px 50px; }}
-    .card {{ padding: 10px 12px; margin-bottom: 8px; }}
-    .value {{ font-size: 1.5em; }}
-    .ttft-value {{ font-size: 1.2em; }}
-    h2 {{ font-size: 0.7em; }}
-    .sub {{ font-size: 0.75em; }}
-    .header h1 {{ font-size: 1em; }}
-    .footer {{ font-size: 0.65em; }}
-  }}
+  @media (max-width: 600px) {
+    body { padding: 12px 12px 100px; }
+    .card { padding: 16px 16px; margin-bottom: 14px; }
+    .value { font-size: 1.6em; }
+    .ttft-value { font-size: 1.3em; }
+    h2 { font-size: 0.75em; margin-bottom: 5px; }
+    .sub { font-size: 0.8em; }
+    .header h1 { font-size: 1.15em; margin-bottom: 14px; }
+    .footer { font-size: 0.7em; }
+    .pressure-badge { font-size: 1.05em; padding: 6px 14px; }
+    .status-dot { width: 8px; height: 8px; margin-right: 4px; }
+    
+    /* Stack floating buttons vertically on left side, away from content */
+    .refresh-btn, .update-btn, .forward-btn, .info-btn, .debug-toggle, .capture-btn {
+      right: auto;
+      left: 10px;
+      bottom: auto;
+    }
+    .refresh-btn { bottom: 10px; }
+    .debug-toggle { bottom: 70px; }
+    .update-btn { bottom: 130px; }
+    .info-btn { bottom: 190px; }
+    .forward-btn { bottom: 250px; }
+    .capture-btn { bottom: 310px; }
+  }
+  
+  /* Small mobile (iPhone SE, etc.) */
+  @media (max-width: 375px) {
+    body { padding: 8px 8px 100px; }
+    .card { padding: 12px 12px; margin-bottom: 10px; }
+    .value { font-size: 1.3em; }
+    .ttft-value { font-size: 1.1em; }
+    h2 { font-size: 0.65em; }
+    .sub { font-size: 0.7em; }
+    .header h1 { font-size: 1em; }
+    .footer { font-size: 0.6em; }
+  }
   /* Capture button styling */
   .capture-btn {{ position: fixed; bottom: 220px; right: 20px; background: #30d158; color: white; border: none; padding: 10px; border-radius: 50%; font-size: 16px; cursor: pointer; box-shadow: 0 4px 10px rgba(0,0,0,0.5); opacity: 0.7; }}
   .capture-btn:hover {{ opacity: 1; }}
