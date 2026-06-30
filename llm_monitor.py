@@ -2003,12 +2003,13 @@ if __name__ == "__main__":
     _start_log_server()
     print(f"📂 Log server started on port 8081 — I can read crash/debug logs remotely")
     
-    # Start the watchdog thread
-    _start_watchdog()
-    print("🐕 Watchdog started — monitors log server health every 30s")
+    # Watchdog disabled to prevent crash loop
+    # _start_watchdog()
+    print("🐕 Watchdog disabled (was causing restart loop)")
     
     try:
-        with ReusableTCPServer(("", PORT), Handler) as httpd:
-            httpd.serve_forever()
+        httpd = ReusableTCPServer(("", PORT), Handler)
+        httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        httpd.serve_forever()
     except KeyboardInterrupt:
         pass
